@@ -34,6 +34,9 @@ jobs:
         with:
           target: x86_64
           manylinux: '2_28'
+          # .cargo/config.toml enables crt-static; manylinux omits static glibc.
+          before-script-linux: |
+            dnf install -y --disablerepo='*' --enablerepo=baseos,powertools glibc-static
           # bindings=bin produces one py3-none wheel, shared by all Python versions.
           args: --release --locked --strip --out dist --interpreter /opt/python/cp312-cp312/bin/python
       - uses: actions/upload-artifact@v4
