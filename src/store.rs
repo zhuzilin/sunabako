@@ -273,6 +273,19 @@ fn gpu(spec: &Spec, root: &Path) -> Result<Vec<String>> {
     Ok(uuids)
 }
 
+fn allocate_uid(c: &NodeConfig, existing: &[(u32, u32)]) -> Result<u32> {
+    (0..c.max_sandboxes as u32)
+        .map(|slot| c.uid_start + slot * c.uid_range_size)
+        .find(|&uid| {
+            // Also account for stopped sandboxes made with an older configuration.
+            existing.iter().all(|&(start, size)| {
+                u64::from(uid) + u64::from(c.uid_range_size) <= u64::from(start)
+                    || u64::from(start) + u64::from(size) <= u64::from(uid)
+            })
+        })
+        .context("UID range exhausted")
+}
+
 pub fn create(state: &Path, spec: Spec) -> Result<Value> {
     spec.validate()?;
     let _lock = lock(state)?;
@@ -319,9 +332,18 @@ pub fn create(state: &Path, spec: Spec) -> Result<Value> {
         existing.len() < c.max_sandboxes,
         "max_sandboxes reached (delete unused sandboxes)"
     );
-    let uid = (c.uid_start..c.uid_start + c.max_sandboxes as u32)
-        .find(|u| !existing.iter().any(|(_, r, _)| r.uid == *u))
-        .context("UID range exhausted")?;
+    let uid = allocate_uid(
+        &c,
+        &existing
+            .iter()
+            .map(|(_, r, _)| (r.uid, r.uid_range_size))
+            .collect::<Vec<_>>(),
+    )?;
+    let uid_range_size = if spec.runtime == "native" {
+        c.uid_range_size
+    } else {
+        1
+    };
     fs::create_dir(&d)?;
     fs::set_permissions(&d, fs::Permissions::from_mode(0o711))?;
     let setup = (|| -> Result<()> {
@@ -383,10 +405,24 @@ pub fn create(state: &Path, spec: Spec) -> Result<Value> {
             "chown rootfs failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        if uid_range_size > 1 {
+            // Guest users must traverse '/', while the outer sandbox directory
+            // keeps every other sandbox UID out of this rootfs and its metadata.
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o700))?;
+            unsafe {
+                linux::cv(
+                    libc::chown(linux::cstr(&d)?.as_ptr(), uid, uid),
+                    "own sandbox directory",
+                )?;
+            }
+        } else {
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
         let record = Record {
             spec,
             uid,
+            uid_range_size,
             created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             gpu_uuids,
         };
@@ -480,7 +516,9 @@ pub fn start_locked(state: &Path, d: &Path, c: &NodeConfig) -> Result<()> {
 }
 pub fn inspect(d: &Path) -> Result<Value> {
     let r: Record = read(&d.join("record.json"))?;
-    Ok(json!({"spec":r.spec,"uid":r.uid,"status":status(d)?,"directory":d}))
+    Ok(
+        json!({"spec":r.spec,"uid":r.uid,"uid_range_size":r.uid_range_size,"status":status(d)?,"directory":d}),
+    )
 }
 pub fn transition(d: &Path, desired: &str) -> Result<Value> {
     let s = status(d)?;
@@ -498,5 +536,26 @@ pub fn transition(d: &Path, desired: &str) -> Result<Value> {
         ensure!(s.state != "failed", "sandbox failed: {:?}", s.reason);
         ensure!(Instant::now() < end, "transition to {desired} timed out");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uid_allocation_checks_entire_existing_ranges_after_reconfiguration() {
+        let c = NodeConfig {
+            uid_start: 100000,
+            uid_range_size: 65536,
+            max_sandboxes: 3,
+            ..Default::default()
+        };
+        assert_eq!(allocate_uid(&c, &[]).unwrap(), 100000);
+        // A legacy single UID in the middle reserves the entire overlapping slot.
+        assert_eq!(allocate_uid(&c, &[(100500, 1)]).unwrap(), 165536);
+        // A range made with an older stride can overlap two new slots.
+        assert_eq!(allocate_uid(&c, &[(130000, 65536)]).unwrap(), 231072);
+        assert!(allocate_uid(&c, &[(100000, 3 * 65536)]).is_err());
     }
 }

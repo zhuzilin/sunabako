@@ -121,7 +121,9 @@ class Files:
     def __init__(self, sandbox: Sandbox):
         self._sandbox = sandbox
 
-    def write(self, path: str, data: str | bytes | Path) -> None:
+    def write(self, path: str, data: str | bytes | Path, *, user: str = "root") -> None:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", user):
+            raise ValueError("Invalid guest user")
         source = data.open("rb") if isinstance(data, Path) else io.BytesIO(data.encode() if isinstance(data, str) else data)
         with source:
             append = False
@@ -129,15 +131,17 @@ class Files:
                 content = source.read(4 << 20)
                 if not content and append:
                     break
-                self._sandbox._rpc({"op": "write", "path": path, "data": base64.b64encode(content).decode(), "append": append})
+                self._sandbox._rpc({"op": "write", "path": path, "data": base64.b64encode(content).decode(), "append": append, "user": user})
                 append = True
                 if not content:
                     break
 
-    def read(self, path: str, *, format: str = "text") -> str | bytes:
+    def read(self, path: str, *, format: str = "text", user: str = "root") -> str | bytes:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", user):
+            raise ValueError("Invalid guest user")
         if format not in ("text", "bytes"):
             raise ValueError("format must be text or bytes")
-        value = self._sandbox._rpc({"op": "read", "path": path})
+        value = self._sandbox._rpc({"op": "read", "path": path, "user": user})
         data = base64.b64decode(value["data"])
         return data.decode() if format == "text" else data
 
@@ -233,11 +237,11 @@ class AsyncFiles:
     def __init__(self, files: Files):
         self._files = files
 
-    async def write(self, path: str, data: str | bytes | Path) -> None:
-        await asyncio.to_thread(self._files.write, path, data)
+    async def write(self, path: str, data: str | bytes | Path, *, user: str = "root") -> None:
+        await asyncio.to_thread(self._files.write, path, data, user=user)
 
-    async def read(self, path: str, *, format: str = "text") -> str | bytes:
-        return await asyncio.to_thread(self._files.read, path, format=format)
+    async def read(self, path: str, *, format: str = "text", user: str = "root") -> str | bytes:
+        return await asyncio.to_thread(self._files.read, path, format=format, user=user)
 
 
 class AsyncSandbox:
@@ -274,11 +278,11 @@ class AsyncSandbox:
 
     async def write_file(self, sandbox_path: str, content: str | bytes | Path, *, user: str = "root") -> None:
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", user): raise ValueError("Invalid guest user")
-        await self.files.write(sandbox_path, content)
+        await self.files.write(sandbox_path, content, user=user)
 
     async def read_file(self, sandbox_path: str, *, user: str = "root") -> str:
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", user): raise ValueError("Invalid guest user")
-        return await self.files.read(sandbox_path)
+        return await self.files.read(sandbox_path, user=user)
 
     async def __aenter__(self) -> AsyncSandbox: return self
     async def __aexit__(self, *_exc) -> None: await self.kill()

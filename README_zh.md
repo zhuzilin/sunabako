@@ -8,7 +8,7 @@
 
 ## 构建与安装
 
-当前支持 Linux x86-64、Python 3.10+ 和 Linux 5.15+ 内核。从源码构建需要 Rust/Cargo；安装已构建的 wheel 无需 Rust 或 maturin。节点管理操作以**外层容器内的 root** 身份执行，各沙箱使用不同的外层 UID，并移除 capabilities。环境必须启用 user namespace；PRoot 模式还要求 Landlock 和 `Yama ptrace_scope >= 1`。
+当前支持 Linux x86-64、Python 3.10+；native 模式也可在 Linux 5.4 运行，PRoot 模式需要启用 Landlock 的内核（已测试的基线为 Linux 5.15）。从源码构建需要 Rust/Cargo；安装已构建的 wheel 无需 Rust 或 maturin。节点管理操作以**外层容器内的 root** 身份执行，各沙箱使用不同的外层 UID，非 root 命令移除全部 capabilities。环境必须启用 user namespace；PRoot 模式还要求 Landlock 和 `Yama ptrace_scope >= 1`。
 
 ```bash
 python -m pip install 'maturin>=1.8,<2'
@@ -116,7 +116,21 @@ with Sandbox.create(
 
 `commands.run()` 返回 `exit_code`、`stdout`、`stderr`、`timed_out` 和 `truncated`。非零退出码会触发 `CommandExitException`，可用 `check=False` 改为检查返回值。每个输出流最多 2 MiB，单次读取文件最多 8 MiB；上传按 4 MiB 分块，支持大的 `Path` 输入，中断上传可能留下部分文件。
 
-命令超时会终止整个沙箱，确保脱离父进程的子进程也无法继续运行；文件系统仍保留，可以用 `start()` 重启并检查。PRoot 支持 `commands.run(..., user="agent")`，需先在镜像中创建用户。沙箱内的用户身份都映射到同一个无特权外层 UID，不构成沙箱内部的安全边界。原生模式目前只支持 namespace root。后台 shell 任务可以在沙箱内持续运行，脱离前应将输出流重定向到文件。
+命令超时会终止整个沙箱，确保脱离父进程的子进程也无法继续运行；文件系统仍保留，可以用 `start()` 重启并检查。PRoot 支持 `commands.run(..., user="agent")`，需先在镜像中创建用户。PRoot 中的用户身份都映射到同一个无特权外层 UID，不构成沙箱内部的安全边界。
+
+native 默认保留仅支持 namespace root 的行为。配置 `uid_range_size=65536` 后，可创建并使用真实的 guest 用户；从 `uid_start`（例如 100000）开始，需要为每个节点预留 `max_sandboxes * uid_range_size` 个空闲的外层 UID/GID，不同节点的范围不能重叠。外层容器须允许私有挂载和 UID/GID 映射，可使用 privileged Docker 在 Linux 5.4 上运行，无需 PRoot 或 Landlock。state 的父目录必须可遍历，例如 `/workspace`，不能放在权限为 0700 的 `/root` 下。
+
+```python
+node.configure(uid_start=100000, uid_range_size=65536, max_sandboxes=2,
+               cgroup_parent="/sys/fs/cgroup/delegated")
+with Sandbox.create(node=node, runtime="native", memory_mb=512) as sb:
+    sb.commands.run("useradd -m -s /bin/bash agent")
+    sb.commands.run("id", user="agent")
+    sb.files.write("/home/agent/example.txt", "hello", user="agent")
+    assert sb.files.read("/home/agent/example.txt", user="agent") == "hello"
+```
+
+native 从镜像的 `/etc/passwd`、`/etc/group` 解析用户和附加组。guest root 仅保留用户 namespace 内用于用户初始化的 chown、DAC override、fowner、setuid、setgid capabilities；其他用户以真实映射后的 UID/GID 运行，清空全部 capabilities 并启用 no-new-privileges。文件 API 同样按所选用户检查权限。修改节点配置不会改变已有沙箱的 UID 映射。多用户模式的文件 RPC 拒绝 procfs 文件描述符，避免泄漏可信文件工作进程自身的状态；查看 procfs 请使用 `commands.run()`。后台 shell 任务可以在沙箱内持续运行，脱离前应将输出流重定向到文件。
 
 `network="none"` 使用只含 loopback 的独立网络 namespace。显式设置 `network="host"` 时共享外层容器的网络 namespace。当前不会创建虚拟网桥或配置端口映射。
 
@@ -153,7 +167,7 @@ sb.snapshot("/shared/snapshots/task-001")
 
 ## 隔离机制与当前范围
 
-原生模式使用内核 chroot，以及 user、PID、IPC、UTS、mount namespace。bind mount 和独立 procfs 需要外层 AppArmor 策略允许 mount。PRoot 模式通过可信 init 维持独立 PID namespace，由 PRoot 转换文件系统路径，再由 Landlock 约束真实内核路径。命令继承 syscall filter、no-new-privileges、空 capabilities、PID 限制和专用外层 UID。rootfs 只包含选定的 NVIDIA 设备节点和驱动库。
+原生模式使用内核 chroot，以及 user、PID、IPC、UTS、mount namespace。bind mount 和独立 procfs 需要外层 AppArmor 策略允许 mount。PRoot 模式通过可信 init 维持独立 PID namespace，由 PRoot 转换文件系统路径，再由 Landlock 约束真实内核路径。命令继承 syscall filter、no-new-privileges、PID 限制和专用外层 UID。native 非 root 命令及 PRoot 命令的 capabilities 为空；native 多用户模式的 guest root 只保留前述少量 capabilities。rootfs 只包含选定的 NVIDIA 设备节点和驱动库。
 
 Landlock ABI 1 上使用小型 helper 保持包管理器所需的跨目录 rename 和 hard-link 语义。每个 helper 都通过内核 chroot 限制在一个可写映射中，使用沙箱 UID，移除 capabilities 和无关文件描述符。只读映射不启动 helper。这些进程计入同一沙箱 cgroup，也纳入 RSS 监测。
 

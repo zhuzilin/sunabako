@@ -3,7 +3,8 @@ use anyhow::{bail, ensure, Context, Result};
 use std::{
     ffi::CString,
     fs, io,
-    os::unix::{fs::MetadataExt, io::AsRawFd},
+    io::{Read, Write},
+    os::unix::{fs::MetadataExt, io::AsRawFd, net::UnixStream},
     path::Path,
 };
 
@@ -122,7 +123,57 @@ pub fn task_signal(pid: i32, tid: i32, start: u64, sig: i32) {
     }
 }
 
-pub fn enter_namespaces(record: &Record) -> Result<()> {
+pub fn map_uid_range(pid: i32, record: &Record) -> Result<()> {
+    // Only the privileged supervisor writes this mapping, for its own blocked
+    // child. No host UID 0 is mapped into the sandbox. Leaving setgroups allowed
+    // is safe here because the supervisor has CAP_SETGID in the parent namespace.
+    let mapping = format!("0 {} {}\n", record.uid, record.uid_range_size);
+    fs::write(format!("/proc/{pid}/uid_map"), &mapping).context("map dedicated guest UIDs")?;
+    fs::write(format!("/proc/{pid}/gid_map"), &mapping).context("map dedicated guest GIDs")?;
+    Ok(())
+}
+
+pub fn enter_namespaces(record: &Record, mapping_ready: &mut UnixStream) -> Result<()> {
+    if record.native_users() {
+        // NVIDIA's container runtime overlays parts of /proc. Linux locks those
+        // mounts when entering a less privileged user namespace, which prevents
+        // mounting a fresh procfs for the sandbox PID namespace. Start with a
+        // complete procfs in a PRIVATE bootstrap mount namespace, while still
+        // outer root. This changes no mounts in the parent container.
+        unsafe {
+            cv(
+                libc::unshare(libc::CLONE_NEWNS),
+                "create bootstrap mount namespace",
+            )?;
+        }
+        mount(
+            Path::new("none"),
+            Path::new("/"),
+            None,
+            libc::MS_REC | libc::MS_PRIVATE,
+        )
+        .context("native guest users require private mounts in the outer container")?;
+        let mut overlays: Vec<_> = fs::read_to_string("/proc/self/mountinfo")?
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(4))
+            .filter(|path| path.starts_with("/proc/"))
+            .map(|path| {
+                path.replace("\\040", " ")
+                    .replace("\\011", "\t")
+                    .replace("\\012", "\n")
+                    .replace("\\134", "\\")
+            })
+            .collect();
+        overlays.sort_by_key(|path| std::cmp::Reverse(path.len()));
+        for path in overlays {
+            unsafe {
+                cv(
+                    libc::umount2(CString::new(path)?.as_ptr(), libc::MNT_DETACH),
+                    "detach procfs overlay in private bootstrap namespace",
+                )?;
+            }
+        }
+    }
     unsafe {
         cv(
             libc::setgroups(0, std::ptr::null()),
@@ -136,9 +187,19 @@ pub fn enter_namespaces(record: &Record) -> Result<()> {
         )?;
         cv(libc::unshare(libc::CLONE_NEWUSER), "create user namespace")?;
     }
-    fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/uid_map", format!("0 {} 1\n", record.uid))?;
-    fs::write("/proc/self/gid_map", format!("0 {} 1\n", record.uid))?;
+    if record.native_users() {
+        mapping_ready.write_all(b"U")?;
+        let mut reply = [0];
+        mapping_ready.read_exact(&mut reply)?;
+        ensure!(
+            reply == *b"M",
+            "supervisor did not install UID/GID mappings"
+        );
+    } else {
+        fs::write("/proc/self/setgroups", "deny")?;
+        fs::write("/proc/self/uid_map", format!("0 {} 1\n", record.uid))?;
+        fs::write("/proc/self/gid_map", format!("0 {} 1\n", record.uid))?;
+    }
     let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
     if record.spec.runtime == "native" {
         flags |= libc::CLONE_NEWPID;
@@ -241,7 +302,35 @@ pub fn setup_root(root: &Path, record: &Record) -> Result<bool> {
     Ok(proc_mounted)
 }
 
+// Scoped to the sandbox's user namespace: chown, DAC override, fowner,
+// setgid and setuid let guest root prepare an ordinary unprivileged user.
+pub const GUEST_ROOT_CAPS: u64 = (1 << 0) | (1 << 1) | (1 << 3) | (1 << 6) | (1 << 7);
+// Only trusted init retains SETPCAP, so each fork can empty its bounding set.
+pub const NATIVE_INIT_CAPS: u64 = GUEST_ROOT_CAPS | (1 << 5) | (1 << 8);
+
 pub fn drop_privileges() -> Result<()> {
+    restrict_privileges(0, false)
+}
+
+pub fn check_file_rpc(file: &fs::File) -> Result<()> {
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    unsafe {
+        cv(
+            libc::fstatfs(file.as_raw_fd(), &mut stat),
+            "inspect file filesystem",
+        )?;
+    }
+    // The file worker is a fork of trusted init, not an exec of guest code.
+    // Its /proc/self would otherwise expose inherited supervisor memory/env.
+    // Check the opened descriptor so symlinks cannot bypass this boundary.
+    ensure!(
+        stat.f_type != libc::PROC_SUPER_MAGIC,
+        "file RPC cannot inspect procfs; use commands.run for guest process information"
+    );
+    Ok(())
+}
+
+pub fn restrict_privileges(keep: u64, ambient: bool) -> Result<()> {
     #[repr(C)]
     struct Header {
         version: u32,
@@ -265,21 +354,46 @@ pub fn drop_privileges() -> Result<()> {
             "lock securebits",
         )?;
         for cap in 0..=40 {
-            libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+            if keep & (1u64 << cap) == 0 && libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) > 0 {
+                cv(
+                    libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0),
+                    "drop bounding capability",
+                )?;
+            }
         }
+        cv(
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            ),
+            "clear ambient capabilities",
+        )?;
         let h = Header {
             version: 0x20080522,
             pid: 0,
         };
-        let d = [Data {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        }; 2];
+        let d = [0, 32].map(|shift| Data {
+            effective: (keep >> shift) as u32,
+            permitted: (keep >> shift) as u32,
+            inheritable: if ambient { (keep >> shift) as u32 } else { 0 },
+        });
         cv(
             libc::syscall(libc::SYS_capset, &h, d.as_ptr()) as i32,
-            "clear capabilities",
+            "restrict capabilities",
         )?;
+        if ambient {
+            for cap in 0..=40 {
+                if keep & (1u64 << cap) != 0 {
+                    cv(
+                        libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, cap, 0, 0),
+                        "set guest root ambient capability",
+                    )?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -554,6 +668,12 @@ pub fn copy_device(src: &Path, root: &Path) -> Result<()> {
         cv(
             libc::mknod(cstr(&dst)?.as_ptr(), libc::S_IFCHR | 0o666, md.rdev()),
             "create sandbox device",
+        )?;
+        // mknod applies the caller's umask. Device access must also work for
+        // mapped non-root guest users, independent of the supervisor's umask.
+        cv(
+            libc::chmod(cstr(&dst)?.as_ptr(), 0o666),
+            "set sandbox device permissions",
         )?;
     }
     Ok(())

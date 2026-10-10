@@ -70,31 +70,202 @@ fn drain(reader: &mut impl Read, buf: &mut Vec<u8>, truncated: &mut bool) -> Res
     Ok(())
 }
 
+#[derive(Debug)]
+struct GuestUser {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+    home: String,
+}
+
+fn guest_user(user: &str, record: &Record) -> Result<GuestUser> {
+    ensure!(
+        !user.is_empty()
+            && user
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
+        "invalid guest user"
+    );
+    if user == "root" {
+        return Ok(GuestUser {
+            uid: 0,
+            gid: 0,
+            groups: vec![],
+            home: "/root".into(),
+        });
+    }
+    ensure!(
+        record.native_users(),
+        "native guest users require node uid_range_size > 1 (normally 65536)"
+    );
+    // Resolve only the guest's local account databases, without loading NSS
+    // modules or running guest code inside the trusted init process.
+    let passwd = fs::read_to_string("/etc/passwd")?;
+    let fields: Vec<_> = passwd
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split(':').collect();
+            (fields.len() == 7 && fields[0] == user).then_some(fields)
+        })
+        .with_context(|| format!("unknown guest user {user}"))?;
+    let uid: u32 = fields[2].parse()?;
+    let gid: u32 = fields[3].parse()?;
+    ensure!(
+        uid > 0 && uid < record.uid_range_size && gid < record.uid_range_size,
+        "guest UID/GID is outside the sandbox mapping"
+    );
+    let mut groups = vec![gid];
+    for line in fs::read_to_string("/etc/group")?.lines() {
+        let fields: Vec<_> = line.split(':').collect();
+        if fields.len() == 4 && fields[3].split(',').any(|name| name == user) {
+            let group: u32 = fields[2].parse()?;
+            ensure!(
+                group < record.uid_range_size,
+                "guest supplementary GID is outside the sandbox mapping"
+            );
+            groups.push(group);
+        }
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    Ok(GuestUser {
+        uid,
+        gid,
+        groups,
+        home: fields[5].into(),
+    })
+}
+
+fn set_guest_user(user: &GuestUser) -> Result<()> {
+    unsafe {
+        linux::cv(
+            libc::setgroups(user.groups.len(), user.groups.as_ptr()),
+            "set guest supplementary groups",
+        )?;
+        linux::cv(
+            libc::setresgid(user.gid, user.gid, user.gid),
+            "set guest gid",
+        )?;
+        linux::cv(
+            libc::setresuid(user.uid, user.uid, user.uid),
+            "set guest uid",
+        )?;
+    }
+    // Securebits keep capabilities across the trusted UID transition only.
+    // Clear them, including bounding/ambient sets, before any non-root code runs.
+    linux::restrict_privileges(
+        if user.uid == 0 {
+            linux::GUEST_ROOT_CAPS
+        } else {
+            0
+        },
+        user.uid == 0,
+    )
+}
+
+fn file_as_user(
+    record: &Record,
+    user: &str,
+    action: impl FnOnce() -> Result<Value>,
+) -> Result<Value> {
+    if !record.native_users() {
+        ensure!(
+            user == "root" || record.spec.runtime == "proot",
+            "native guest users require node uid_range_size > 1"
+        );
+        return action();
+    }
+    let user = guest_user(user, record)?;
+    let (mut reader, mut writer) = UnixStream::pair()?;
+    reader.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let pid = unsafe { libc::fork() };
+    linux::cv(pid, "fork file operation")?;
+    if pid == 0 {
+        drop(reader);
+        let result = (|| {
+            set_guest_user(&user)?;
+            linux::seccomp()?;
+            action()
+        })();
+        let value = result.unwrap_or_else(|e| json!({"error":format!("{e:#}")}));
+        let _ = serde_json::to_writer(&mut writer, &value);
+        let _ = writer.write_all(b"\n");
+        unsafe {
+            libc::_exit(0);
+        }
+    }
+    drop(writer);
+    let mut line = String::new();
+    let result = BufReader::new(&mut reader)
+        .take(MAX_REQUEST)
+        .read_line(&mut line);
+    unsafe {
+        if result.is_err() {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        loop {
+            if libc::waitpid(pid, std::ptr::null_mut(), 0) >= 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+    }
+    result?;
+    let value: Value =
+        serde_json::from_str(&line).context("file operation exited without a response")?;
+    if let Some(error) = value.get("error") {
+        bail!("file operation: {error}");
+    }
+    Ok(value)
+}
+
 fn execute(request: Request, record: &Record) -> Result<(Value, bool)> {
     match request {
         Request::Ping => Ok((json!({"ok":true}), false)),
-        Request::Write { path, data, append } => {
+        Request::Write {
+            path,
+            data,
+            append,
+            user,
+        } => {
             ensure!(path.starts_with('/'), "file path must be absolute");
             let data = STANDARD.decode(data)?;
-            if let Some(p) = Path::new(&path).parent() {
-                fs::create_dir_all(p)?;
-            }
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(append)
-                .truncate(!append)
-                .open(path)?;
-            file.write_all(&data)?;
-            Ok((json!({"ok":true}), false))
+            let value = file_as_user(record, &user, || {
+                if let Some(p) = Path::new(&path).parent() {
+                    fs::create_dir_all(p)?;
+                }
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(append)
+                    .truncate(!append && !record.native_users())
+                    .open(path)?;
+                if record.native_users() {
+                    linux::check_file_rpc(&file)?;
+                }
+                if !append && record.native_users() {
+                    file.set_len(0)?;
+                }
+                file.write_all(&data)?;
+                Ok(json!({"ok":true}))
+            })?;
+            Ok((value, false))
         }
-        Request::Read { path } => {
+        Request::Read { path, user } => {
             ensure!(path.starts_with('/'), "file path must be absolute");
-            let mut bytes = vec![];
-            let f = fs::File::open(path)?;
-            f.take(8 << 20).read_to_end(&mut bytes)?;
-            ensure!(bytes.len() < 8 << 20, "file exceeds read RPC limit (8 MiB)");
-            Ok((json!({"data":STANDARD.encode(bytes)}), false))
+            let value = file_as_user(record, &user, || {
+                let mut bytes = vec![];
+                let f = fs::File::open(path)?;
+                if record.native_users() {
+                    linux::check_file_rpc(&f)?;
+                }
+                f.take(8 << 20).read_to_end(&mut bytes)?;
+                ensure!(bytes.len() < 8 << 20, "file exceeds read RPC limit (8 MiB)");
+                Ok(json!({"data":STANDARD.encode(bytes)}))
+            })?;
+            Ok((value, false))
         }
         Request::Exec {
             argv,
@@ -115,14 +286,19 @@ fn execute(request: Request, record: &Record) -> Result<(Value, bool)> {
                         .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
                 "invalid guest user"
             );
-            let mut cmd = if user == "root" {
+            let identity = if record.native_users() {
+                Some(guest_user(&user, record)?)
+            } else {
+                None
+            };
+            let mut cmd = if user == "root" || record.native_users() {
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
                 c
             } else {
                 ensure!(
                     record.spec.runtime == "proot",
-                    "additional guest users currently require PRoot"
+                    "native guest users require node uid_range_size > 1 (normally 65536)"
                 );
                 let mut c = Command::new("runuser");
                 c.args(["-u", &user, "--"]).args(&argv);
@@ -137,16 +313,24 @@ fn execute(request: Request, record: &Record) -> Result<(Value, bool)> {
                 .env("HOME", "/root")
                 .env("LANG", "C.UTF-8")
                 .env("TMPDIR", "/tmp")
-                .envs(&record.spec.env)
-                .envs(env)
+                .envs(&record.spec.env);
+            if let Some(identity) = &identity {
+                cmd.env("HOME", &identity.home)
+                    .env("USER", &user)
+                    .env("LOGNAME", &user);
+            }
+            cmd.envs(env)
                 .env("CUDA_VISIBLE_DEVICES", record.gpu_uuids.join(","))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             unsafe {
-                cmd.pre_exec(|| {
+                cmd.pre_exec(move || {
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(user) = &identity {
+                        set_guest_user(user).map_err(std::io::Error::other)?;
                     }
                     linux::seccomp().map_err(std::io::Error::other)
                 });
@@ -203,7 +387,11 @@ fn init(
     };
     if !prepared {
         linux::limits(record.spec.pids_max)?;
-        linux::drop_privileges()?;
+        if record.native_users() {
+            linux::restrict_privileges(linux::NATIVE_INIT_CAPS, false)?;
+        } else {
+            linux::drop_privileges()?;
+        }
     }
     // Tracees cannot inspect the trusted PID 1 via procfs or ptrace.
     if !prepared {
@@ -406,6 +594,7 @@ fn proot_init(
 fn child(
     listener: UnixListener,
     ready: UnixStream,
+    mut mapping_ready: UnixStream,
     root: &Path,
     record: &Record,
     parent: i32,
@@ -418,7 +607,8 @@ fn child(
             unsafe { libc::getpid() }.to_string(),
         )?;
     }
-    linux::enter_namespaces(record)?;
+    linux::enter_namespaces(record, &mut mapping_ready)?;
+    drop(mapping_ready);
     unsafe {
         linux::cv(
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0),
@@ -466,16 +656,21 @@ pub fn supervise(dir: &Path, config: &NodeConfig) -> Result<()> {
     let _ = fs::remove_file(dir.join("control.sock"));
     let listener = UnixListener::bind(dir.join("control.sock"))?;
     let (mut read, write) = UnixStream::pair()?;
+    let (mut map_parent, map_child) = UnixStream::pair()?;
+    map_parent.set_read_timeout(Some(Duration::from_secs(20)))?;
+    map_child.set_read_timeout(Some(Duration::from_secs(20)))?;
     read.set_read_timeout(Some(Duration::from_secs(20)))?;
     let parent = unsafe { libc::getpid() };
     let launcher = unsafe { libc::fork() };
     linux::cv(launcher, "fork sandbox launcher")?;
     if launcher == 0 {
         drop(read);
+        drop(map_parent);
         let mut notify = write.try_clone()?;
         if let Err(e) = child(
             listener,
             write,
+            map_child,
             &root,
             &record,
             parent,
@@ -491,6 +686,7 @@ pub fn supervise(dir: &Path, config: &NodeConfig) -> Result<()> {
         }
     }
     drop(write);
+    drop(map_child);
     drop(listener);
     let mut status = Status {
         state: "starting".into(),
@@ -499,6 +695,16 @@ pub fn supervise(dir: &Path, config: &NodeConfig) -> Result<()> {
         ..Default::default()
     };
     let setup = (|| -> Result<()> {
+        if record.native_users() {
+            let mut request = [0];
+            map_parent
+                .read_exact(&mut request)
+                .context("wait for user namespace")?;
+            ensure!(request == *b"U", "invalid UID mapping handshake");
+            linux::map_uid_range(launcher, &record)?;
+            map_parent.write_all(b"M")?;
+        }
+        drop(map_parent);
         let mut reader = BufReader::new(&mut read);
         for _ in 0..if record.spec.runtime == "proot" { 1 } else { 2 } {
             let mut line = String::new();

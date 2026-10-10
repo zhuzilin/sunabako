@@ -9,6 +9,9 @@ pub struct NodeConfig {
     pub memory_overcommit: f64,
     pub max_sandboxes: usize,
     pub uid_start: u32,
+    /// Number of dedicated outer UIDs/GIDs reserved per native sandbox.
+    /// One preserves the root-only mode; 65536 enables ordinary guest users.
+    pub uid_range_size: u32,
     pub gpu_slots_per_device: usize,
     pub cgroup_parent: Option<PathBuf>,
     pub monitor_interval_ms: u64,
@@ -24,6 +27,7 @@ impl Default for NodeConfig {
             memory_overcommit: 1.0,
             max_sandboxes: 128,
             uid_start: 60000,
+            uid_range_size: 1,
             gpu_slots_per_device: 4,
             cgroup_parent: None,
             monitor_interval_ms: 25,
@@ -48,9 +52,11 @@ impl NodeConfig {
         );
         ensure!(
             self.uid_start >= 10000
+                && self.uid_range_size > 0
                 && self
-                    .uid_start
-                    .checked_add(self.max_sandboxes as u32)
+                    .uid_range_size
+                    .checked_mul(self.max_sandboxes as u32)
+                    .and_then(|size| self.uid_start.checked_add(size))
                     .is_some(),
             "invalid dedicated UID range"
         );
@@ -189,9 +195,19 @@ pub fn valid_id(id: &str) -> Result<()> {
 pub struct Record {
     pub spec: Spec,
     pub uid: u32,
+    #[serde(default = "single_uid")]
+    pub uid_range_size: u32,
     pub created_at: u64,
     #[serde(default)]
     pub gpu_uuids: Vec<String>,
+}
+fn single_uid() -> u32 {
+    1
+}
+impl Record {
+    pub fn native_users(&self) -> bool {
+        self.spec.runtime == "native" && self.uid_range_size > 1
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -227,9 +243,13 @@ pub enum Request {
         data: String,
         #[serde(default)]
         append: bool,
+        #[serde(default = "root_user")]
+        user: String,
     },
     Read {
         path: String,
+        #[serde(default = "root_user")]
+        user: String,
     },
     Ping,
 }
@@ -264,5 +284,30 @@ mod tests {
         assert!(c.validate().is_ok());
         c.uid_start = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn uid_ranges_cannot_wrap_or_include_invalid_uid() {
+        let mut c = NodeConfig {
+            uid_range_size: 65536,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+        c.uid_range_size = 0;
+        assert!(c.validate().is_err());
+        c.uid_range_size = u32::MAX;
+        assert!(c.validate().is_err());
+        c.uid_range_size = 65536;
+        c.uid_start = u32::MAX - 65535;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn existing_nodes_and_file_requests_keep_root_only_defaults() {
+        let c: NodeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.uid_range_size, 1);
+        let request: Request =
+            serde_json::from_str(r#"{"op":"read","path":"/root/file"}"#).unwrap();
+        assert!(matches!(request, Request::Read { user, .. } if user == "root"));
     }
 }

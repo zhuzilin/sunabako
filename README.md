@@ -17,10 +17,11 @@ OOM and must not be used to oversubscribe production workloads.
 
 ## Build and install
 
-Linux x86-64, Python 3.10+, and kernel 5.15+ are currently required. Building
+Linux x86-64 and Python 3.10+ are required. Native mode also works on Linux 5.4;
+PRoot requires a Landlock-enabled kernel (the tested baseline is Linux 5.15). Building
 from source needs Rust/Cargo; installing a built wheel needs neither Rust nor maturin.
 Node operations run as root **inside the allocated outer container**; sandboxes
-run under distinct outer UIDs with capabilities removed. User namespaces must
+run under distinct outer UIDs. Non-root commands have all capabilities removed. User namespaces must
 be enabled. PRoot mode additionally requires Landlock and Yama ptrace_scope >= 1.
 
 ```bash
@@ -196,8 +197,35 @@ terminates the whole sandbox so detached descendants cannot outlive its deadline
 the filesystem remains available for `start()` and inspection. PRoot supports
 image users through `commands.run(..., user="agent")`; create that user in the
 image first. All guest identities map to the sandbox's one unprivileged outer
-UID, so they do not form security boundaries within a sandbox. Native mode
-currently supports namespace root only. Shell background jobs persist within the sandbox;
+UID, so they do not form security boundaries within a sandbox. Native mode defaults
+to namespace root only. To enable real guest users, configure `uid_range_size=65536`
+and reserve `max_sandboxes * uid_range_size` unused outer UIDs/GIDs starting at
+`uid_start` (for example 100000). Keep the ranges of separate nodes disjoint.
+This mode requires the outer container to permit private mounts and privileged
+UID/GID mapping. It works with a privileged Docker container on Linux 5.4 and
+does not require PRoot or Landlock. Node state must be reachable through searchable
+parent directories, such as `/workspace`, rather than a mode-0700 `/root`.
+
+```python
+node.configure(uid_start=100000, uid_range_size=65536, max_sandboxes=2,
+               cgroup_parent="/sys/fs/cgroup/delegated")
+with Sandbox.create(node=node, runtime="native", memory_mb=512) as sb:
+    sb.commands.run("useradd -m -s /bin/bash agent")
+    sb.commands.run("id", user="agent")
+    sb.files.write("/home/agent/example.txt", "hello", user="agent")
+    assert sb.files.read("/home/agent/example.txt", user="agent") == "hello"
+```
+
+Native guest users are resolved from the image's `/etc/passwd` and `/etc/group`.
+Guest root retains only namespace-scoped chown, DAC override, fowner, setuid and
+setgid capabilities for user setup. Other users run with their real mapped IDs,
+supplementary groups, empty capability sets and no-new-privileges. File operations
+also enforce the selected user's permissions. Existing root-only records keep
+their original mapping when a node configuration changes.
+Use `commands.run()` to inspect procfs: native multi-user file RPCs reject procfs
+descriptors so the trusted file worker's own process state is never exposed.
+
+Shell background jobs persist within the sandbox;
 redirect their standard streams to files before detaching them.
 
 `network="none"` uses a private network namespace with loopback only. Explicit
@@ -267,7 +295,9 @@ and a private procfs require the outer AppArmor policy to permit mount operation
 Without mount permission, use PRoot mode: a persistent trusted init runs inside a
 private PID namespace; PRoot translates filesystem paths while Landlock limits
 the actual kernel paths. Commands inherit a syscall filter, no-new-privileges,
-zero capabilities, PID limits, and a dedicated outer UID. Only selected NVIDIA
+PID limits, and a dedicated outer UID. Non-root native commands and PRoot commands
+have zero capabilities; native guest root in multi-user mode has only the limited
+capabilities described above. Only selected NVIDIA
 device nodes and driver libraries are copied into the rootfs.
 
 On Landlock ABI 1, small helpers preserve cross-directory rename and hard-link
