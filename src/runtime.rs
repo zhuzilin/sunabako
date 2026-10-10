@@ -666,15 +666,7 @@ pub fn supervise(dir: &Path, config: &NodeConfig) -> Result<()> {
         drop(read);
         drop(map_parent);
         let mut notify = write.try_clone()?;
-        if let Err(e) = child(
-            listener,
-            write,
-            map_child,
-            &root,
-            &record,
-            parent,
-            config,
-        ) {
+        if let Err(e) = child(listener, write, map_child, &root, &record, parent, config) {
             eprintln!("sandbox init: {e:#}");
             let _ = serde_json::to_writer(&mut notify, &json!({"error":format!("{e:#}")}));
             let _ = notify.write_all(b"\n");
