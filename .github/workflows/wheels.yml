@@ -1,0 +1,131 @@
+name: wheels
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: Linux x86-64 wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: '2_28'
+          # bindings=bin produces one py3-none wheel, shared by all Python versions.
+          args: --release --locked --strip --out dist --interpreter /opt/python/cp312-cp312/bin/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py3-linux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  smoke:
+    name: Installed wheel / Python ${{ matrix.python }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-py3-linux-x86_64
+          path: dist
+      - run: python -m pip install 'twine>=5'
+      - run: python -m twine check --strict dist/*
+      - run: python scripts/check-wheel.py dist/*.whl --report wheel-check.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wheel-check-py${{ matrix.python }}
+          path: wheel-check.json
+
+  sdist:
+    name: Source distribution and clean rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'build>=1.2' 'twine>=5'
+      - run: python -m build --sdist
+      - run: python -m twine check --strict dist/*
+      - run: python -m pip wheel --no-deps dist/*.tar.gz --wheel-dir rebuilt
+      - run: python -m twine check --strict rebuilt/*
+      - run: python scripts/check-wheel.py rebuilt/*.whl --report source-rebuild-check.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-distribution
+          path: dist/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-rebuild-check
+          path: source-rebuild-check.json
+
+  publish:
+    name: Publish to PyPI
+    needs: [checks, smoke, sdist]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sunabako
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-py3-linux-x86_64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: source-distribution
+          path: dist
+      - name: Check release contents and tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/check-release.py --dist dist --tag "$RELEASE_TAG"
+      - name: Publish tested distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true

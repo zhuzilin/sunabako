@@ -1,0 +1,23 @@
+[package]
+include = ["Cargo.toml", "Cargo.lock", "src/**", "python/**", ".cargo/config.toml", "README*.md", "LICENSE", "pyproject.toml", "patches/*", "scripts/*", "tests/*.py", "configs/*.example.json", "verification/*.c"]
+name = "sunabako"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Linux sandboxes inside existing containers, without a Docker daemon"
+
+[[bin]]
+name = "sunabako"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
+

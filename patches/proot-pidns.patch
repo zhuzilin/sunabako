@@ -1,0 +1,234 @@
+diff --git a/src/extension/fake_id0/fake_id0.c b/src/extension/fake_id0/fake_id0.c
+index f51ab46..c0cf867 100644
+--- a/src/extension/fake_id0/fake_id0.c
++++ b/src/extension/fake_id0/fake_id0.c
+@@ -291,9 +291,11 @@ static int handle_sysenter_end(Tracee *tracee, const Config *config)
+ 
+ 	    /* Swap actual and emulated ids to get a chance of
+ 	     * success.  */
+-	    if (uid == config->ruid)
++	    /* Sunabako maps only one outer UID. Image ownership stays under
++             * that UID; PRoot supplies the guest identity view. */
++	    if (uid == config->ruid || (getenv("SUNABAKO_SINGLE_UID") && uid != (uid_t)-1))
+ 		poke_reg(tracee, uid_sysarg, getuid());
+-	    if (gid == config->rgid)
++	    if (gid == config->rgid || (getenv("SUNABAKO_SINGLE_UID") && gid != (gid_t)-1))
+ 		poke_reg(tracee, gid_sysarg, getgid());
+ 
+ 	    return 0;
+diff --git a/src/path/canon.c b/src/path/canon.c
+index a20b353..4011a71 100644
+--- a/src/path/canon.c
++++ b/src/path/canon.c
+@@ -251,6 +251,16 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 	    continue;
+ 	}
+ 
++	/* Sunabako: numeric procfs task IDs need translation BEFORE stat(),
++	 * since procfs belongs to the tracer's (outer) PID namespace. */
++	if (component[0] >= '0' && component[0] <= '9') {
++	    comparison = compare_paths("/proc", guest_path);
++	    if (comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX) {
++	        status = readlink_proc(tracee, scratch_path, guest_path, component, comparison);
++	        if (status == CANONICALIZE) goto canon;
++	        if (status < 0) return status;
++	    }
++	}
+ 	status = join_paths(2, scratch_path, guest_path, component);
+ 	if (status < 0)
+ 	    return status;
+diff --git a/src/path/proc.c b/src/path/proc.c
+index b48894f..25d6bba 100644
+--- a/src/path/proc.c
++++ b/src/path/proc.c
+@@ -25,12 +25,59 @@
+ #include <stdlib.h>		/* atoi(3), strtol(3), */
+ #include <errno.h>		/* E*, */
+ #include <assert.h>		/* assert(3), */
++#include <dirent.h>
++#include <unistd.h>
+ 
+ #include "path/proc.h"
+ #include "tracee/tracee.h"
+ #include "path/path.h"
+ #include "path/binding.h"
+ 
++/* Sunabako: inherited procfs names processes in the tracer's PID namespace.
++ * Translate guest numeric PIDs/TIDs only among tasks in the tracee's namespace.
++ * No cached PID mapping: a recycled PID must never resolve to another task.
++ */
++static pid_t sunabako_proc_pid(const Tracee *tracee, pid_t guest, bool threads)
++{
++    char directory[64], current_ns[64], candidate_ns[64], path[128], line[512];
++    struct dirent *entry;
++    DIR *dir;
++    ssize_t ns_len, other_len;
++    pid_t answer = guest;
++    snprintf(path, sizeof(path), "/proc/%d/ns/pid", tracee->pid);
++    ns_len = readlink(path, current_ns, sizeof(current_ns));
++    if (ns_len < 0) return guest;
++    if (threads) snprintf(directory, sizeof(directory), "/proc/%d/task", tracee->pid);
++    else strcpy(directory, "/proc");
++    dir = opendir(directory);
++    if (!dir) return guest;
++    while ((entry = readdir(dir)) != NULL) {
++        pid_t host = atoi(entry->d_name), inner = 0;
++        if (host <= 0) continue;
++        snprintf(path, sizeof(path), "%s/%d/ns/pid", directory, host);
++        other_len = readlink(path, candidate_ns, sizeof(candidate_ns));
++        if (other_len != ns_len || memcmp(current_ns, candidate_ns, ns_len)) continue;
++        snprintf(path, sizeof(path), "%s/%d/status", directory, host);
++        FILE *f = fopen(path, "r");
++        if (!f) continue;
++        while (fgets(line, sizeof(line), f)) {
++            if (!strncmp(line, "NSpid:", 6)) {
++                char *cursor = line + 6, *end;
++                while (*cursor) {
++                    long value = strtol(cursor, &end, 10);
++                    if (cursor == end) break;
++                    inner = (pid_t)value; cursor = end;
++                }
++                break;
++            }
++        }
++        fclose(f);
++        if (inner == guest) { answer = host; break; }
++    }
++    closedir(dir);
++    return answer;
++}
++
+ /**
+  * This function emulates the @result of readlink("@base/@component")
+  * with respect to @tracee, where @base belongs to "/proc" (according
+@@ -50,10 +97,28 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
+     pid_t pid;
+ 
+     assert(comparison == compare_paths("/proc", base));
++    if (strstr(base, "/task") && !strcmp(strrchr(base, '/'), "/task")) {
++        pid_t guest = atoi(component);
++        if (guest > 0) {
++            pid_t host = sunabako_proc_pid(tracee, guest, true);
++            if (host != guest) {
++                snprintf(result, PATH_MAX, "%s/%d", base, host);
++                return CANONICALIZE;
++            }
++        }
++    }
+ 
+     /* Remember: comparison = compare_paths("/proc", base)  */
+     switch (comparison) {
+     case PATHS_ARE_EQUAL:
++
++        if (atoi(component) > 0) {
++            pid_t guest = atoi(component), host = sunabako_proc_pid(tracee, guest, false);
++            if (host != guest) {
++                snprintf(result, PATH_MAX, "/proc/%d", host);
++                return CANONICALIZE;
++            }
++        }
+ 	/* Substitute "/proc/self" with "/proc/<PID>".  */
+ 	if (strcmp(component, "self") != 0)
+ 	    return DEFAULT;
+diff --git a/src/syscall/exit.c b/src/syscall/exit.c
+index 8d1cfac..8c06d53 100644
+--- a/src/syscall/exit.c
++++ b/src/syscall/exit.c
+@@ -26,6 +26,9 @@
+ #include <linux/net.h>		/* SYS_*, */
+ #include <string.h>		/* strlen(3), */
+ #include <unistd.h>		/* readlink(2), */
++#include <stdint.h>
++#include <stdlib.h>
++#include <sys/socket.h>
+ 
+ #include "syscall/syscall.h"
+ #include "syscall/sysnum.h"
+@@ -45,6 +48,62 @@
+ #include "extension/extension.h"
+ #include "arch.h"
+ 
++/* Optional Sunabako ABI-1 helper. Each socket ends in an unprivileged,
++ * capability-free chroot containing exactly one writable filesystem mapping.
++ * No copying fallback: rename keeps the kernel's atomicity and error semantics.
++ */
++static int sunabako_socket_io(int fd, void *buffer, size_t length, bool sending)
++{
++    char *cursor = buffer;
++    while (length) {
++        ssize_t n = sending ? send(fd, cursor, length, MSG_NOSIGNAL) : recv(fd, cursor, length, 0);
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0) return -EIO;
++        cursor += n; length -= n;
++    }
++    return 0;
++}
++
++static int sunabako_refer(Tracee *tracee, word_t call)
++{
++    const char *mapping = getenv("SUNABAKO_RENAME_HELPERS"), *row;
++    char old_path[PATH_MAX], new_path[PATH_MAX];
++    bool simple = call == PR_rename || call == PR_link;
++    bool link_op = call == PR_link || call == PR_linkat;
++    int fd = -1, error, status;
++    size_t prefix = 0;
++    uint32_t header[4];
++    if (!mapping) return -EXDEV;
++    if (call == PR_linkat && peek_reg(tracee, ORIGINAL, SYSARG_5) != 0) return -EXDEV;
++    status = read_path(tracee, old_path, peek_reg(tracee, MODIFIED, simple ? SYSARG_1 : SYSARG_2));
++    if (status < 0) return status;
++    status = read_path(tracee, new_path, peek_reg(tracee, MODIFIED, simple ? SYSARG_2 : SYSARG_4));
++    if (status < 0) return status;
++    for (row = mapping; *row;) {
++        char *tab;
++        long candidate = strtol(row, &tab, 10);
++        const char *end = strchr(tab, '\n');
++        if (*tab != '\t' || !end || candidate < 3 || candidate > 1023) break;
++        size_t n = end - (tab + 1);
++        if (n > prefix && strlen(old_path) > n && strlen(new_path) > n
++            && !strncmp(old_path, tab + 1, n) && old_path[n] == '/'
++            && !strncmp(new_path, tab + 1, n) && new_path[n] == '/') {
++            prefix = n; fd = (int)candidate;
++        }
++        row = end + 1;
++    }
++    if (fd < 0) return -EXDEV;
++    header[0] = link_op ? 2 : 1;
++    header[1] = call == PR_renameat2 ? peek_reg(tracee, ORIGINAL, SYSARG_5) : 0;
++    header[2] = strlen(old_path + prefix);
++    header[3] = strlen(new_path + prefix);
++    if (sunabako_socket_io(fd, header, sizeof(header), true)
++        || sunabako_socket_io(fd, old_path + prefix, header[2], true)
++        || sunabako_socket_io(fd, new_path + prefix, header[3], true)
++        || sunabako_socket_io(fd, &error, sizeof(error), false)) return -EIO;
++    return -error;
++}
++
+ /**
+  * Translate the output arguments of the current @tracee's syscall in
+  * the @tracee->pid process area. This function sets the result of
+@@ -240,6 +299,12 @@ void translate_syscall_exit(Tracee *tracee)
+ 	status = 0;
+ 	break;
+ 
++    case PR_link:
++    case PR_linkat:
++        if ((int)syscall_result != -EXDEV) goto end;
++        status = sunabako_refer(tracee, syscall_number);
++        break;
++
+     case PR_rename:
+     case PR_renameat:
+     case PR_renameat2:{
+@@ -252,6 +317,11 @@ void translate_syscall_exit(Tracee *tracee)
+ 	    Reg new_reg;
+ 	    char *tmp;
+ 
++	    if ((int)syscall_result == -EXDEV) {
++                status = sunabako_refer(tracee, syscall_number);
++                if (status < 0) break;
++                syscall_result = 0;
++            }
+ 	    /* Error reported by the kernel.  */
+ 	    if ((int) syscall_result < 0)
+ 		goto end;

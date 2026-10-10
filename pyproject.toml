@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sunabako"
+version = "0.1.0"
+description = "Container-native Linux sandboxes with a Rust runtime and an E2B-style Python SDK"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+readme = "README.md"
+classifiers = ["Operating System :: POSIX :: Linux", "Programming Language :: Rust", "Programming Language :: Python :: 3"]
+
+[tool.maturin]
+bindings = "bin"
+python-source = "python"
+python-packages = ["sunabako"]
+include = [{ path = "scripts/*", format = "sdist" }, { path = "patches/*", format = "sdist" }, { path = ".cargo/config.toml", format = "sdist" }, { path = "configs/*.example.json", format = "sdist" }, { path = "tests/*.py", format = "sdist" }, { path = "verification/*.c", format = "sdist" }]
+
+[tool.maturin.sbom]
+# Avoid embedding local source paths in the generated Rust SBOM.
+rust = false
+

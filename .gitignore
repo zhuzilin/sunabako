@@ -1,0 +1,10 @@
+/target/
+/dist/
+/configs/cluster.test.json
+/verification/*.log
+/verification/*.json
+/verification/pypi-ci/
+__pycache__/
+*.egg-info/
+.venv/
+

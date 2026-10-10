@@ -1,0 +1,10 @@
+{
+  "memory_capacity_bytes": 68719476736,
+  "memory_overcommit": 2.0,
+  "max_sandboxes": 128,
+  "uid_start": 60000,
+  "gpu_slots_per_device": 4,
+  "cgroup_parent": "/sys/fs/cgroup/sunabako-delegated",
+  "monitor_interval_ms": 25,
+  "proot_binary": "/usr/local/libexec/sunabako/proot"
+}
