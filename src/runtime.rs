@@ -598,10 +598,9 @@ fn child(
     root: &Path,
     record: &Record,
     parent: i32,
-    cgroup: Option<&Path>,
     config: &NodeConfig,
 ) -> Result<()> {
-    if let Some(cg) = cgroup {
+    if let Some(cg) = store::cgroup_path(config, &record.spec.id) {
         fs::write(
             cg.join("cgroup.procs"),
             unsafe { libc::getpid() }.to_string(),
@@ -674,7 +673,6 @@ pub fn supervise(dir: &Path, config: &NodeConfig) -> Result<()> {
             &root,
             &record,
             parent,
-            store::cgroup_path(config, &record.spec.id).as_deref(),
             config,
         ) {
             eprintln!("sandbox init: {e:#}");
