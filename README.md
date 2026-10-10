@@ -53,8 +53,8 @@ Keep the versions in `Cargo.toml`, `Cargo.lock`, `pyproject.toml` and
 files, push the matching version tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 Only a `v*` tag push builds wheel/source distributions, runs the packaging checks

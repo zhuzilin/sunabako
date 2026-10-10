@@ -25,8 +25,8 @@ wheel 包含静态链接的 Rust 可执行文件和 Python SDK。使用本地 ta
 保持 `Cargo.toml`、`Cargo.lock`、`pyproject.toml` 和 `python/sunabako/__init__.py` 的版本一致。提交并推送发布内容后，推送对应的版本标签：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 只有 `v*` 标签的 push 会构建 wheel 和源码包、验证安装并发布。分支 push、pull request 和手动运行仅执行 Rust 格式、Clippy 和测试检查。发布任务等待所有检查通过，再核对标签版本，上传已经验证的同一份 wheel 和源码包。

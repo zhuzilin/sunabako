@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sunabako"
-version = "0.1.0"
+version = "0.1.1"
 description = "Container-native Linux sandboxes with a Rust runtime and an E2B-style Python SDK"
 requires-python = ">=3.10"
 license = "Apache-2.0"
