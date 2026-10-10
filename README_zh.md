@@ -18,7 +18,7 @@ python -m pip install dist/sunabako-*.whl
 
 wheel 包含静态链接的 Rust 可执行文件和 Python SDK。使用本地 target 目录可以避免共享文件系统上的编译开销。
 
-发布工作流见 [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)：构建一个 Linux x86-64 的 `py3-none` wheel，在 Python 3.10–3.14 上验证安装，并从源码包重新构建。CI 检查 SDK 导入、Rust CLI 和打包结果，无需 root、GPU 或可写 cgroup；需要这些环境条件的运行时验证见下文。
+发布工作流见 [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)：仅在推送 `v*` 标签时构建一个 Linux x86-64 的 `py3-none` wheel，在 Python 3.10–3.14 上验证安装，并从源码包重新构建。CI 检查 SDK 导入、Rust CLI 和打包结果，无需 root、GPU 或可写 cgroup；需要这些环境条件的运行时验证见下文。
 
 在 PyPI 中为项目 `sunabako` 配置 Trusted Publisher，填写实际 GitHub 用户或组织、仓库名、工作流文件名 `wheels.yml` 和环境名 `pypi`，并在 GitHub 仓库中创建该环境。首次发布可配置 [pending publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)。工作流使用 [GitHub OIDC](https://docs.pypi.org/trusted-publishers/using-a-publisher/)，无需在 GitHub secrets 中保存 PyPI API token。
 
@@ -29,7 +29,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-只有 `v*` 标签的 push 会发布。分支 push、pull request 和手动运行只构建、测试。发布任务等待所有检查通过，再核对标签版本，上传已经验证的同一份 wheel 和源码包。
+只有 `v*` 标签的 push 会构建 wheel 和源码包、验证安装并发布。分支 push、pull request 和手动运行仅执行 Rust 格式、Clippy 和测试检查。发布任务等待所有检查通过，再核对标签版本，上传已经验证的同一份 wheel 和源码包。
 
 使用无需 mount 的兼容后端时，通过仓库中的脚本构建带 PID namespace 兼容补丁的 PRoot：
 

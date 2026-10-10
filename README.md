@@ -33,8 +33,9 @@ python -m pip install dist/sunabako-*.whl
 The wheel contains the statically linked Rust executable and the Python package.
 Builds use a local target directory to avoid slow shared-filesystem compilation.
 Release automation is in [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml).
-It builds one Linux x86-64 `py3-none` wheel, tests the installed package on Python
-3.10–3.14, and rebuilds the source distribution in a clean build environment.
+On a `v*` tag push, it builds one Linux x86-64 `py3-none` wheel, tests the installed
+package on Python 3.10–3.14, and rebuilds the source distribution in a clean build
+environment.
 These checks exercise packaging, SDK imports and the Rust CLI without requiring
 root, GPUs or delegated cgroups. The privileged runtime tests below remain
 separate from these packaging checks.
@@ -56,8 +57,9 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Only a `v*` tag push publishes. Branch pushes, pull requests and manual runs
-build and test without uploading to PyPI. The publishing job waits for all
+Only a `v*` tag push builds wheel/source distributions, runs the packaging checks
+and publishes. Branch pushes, pull requests and manual runs only run the Rust
+formatting, Clippy and test checks. The publishing job waits for all
 checks, verifies the package versions against the tag, and uploads the same
 wheel and sdist that passed verification. A mismatched tag or a failed check
 blocks publication.
