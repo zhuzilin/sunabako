@@ -6,5 +6,10 @@
   "gpu_slots_per_device": 4,
   "cgroup_parent": "/sys/fs/cgroup/sunabako-delegated",
   "monitor_interval_ms": 25,
-  "proot_binary": "/usr/local/libexec/sunabako/proot"
+  "proot_binary": "/usr/local/libexec/sunabako/proot",
+  "image_cache_dir": "/var/lib/sunabako-images",
+  "image_cache_max_bytes": 274877906944,
+  "image_cache_min_free_bytes": 8589934592,
+  "image_cache_import_concurrency": 1,
+  "rootfs_clone_concurrency": 32
 }

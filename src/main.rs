@@ -1,6 +1,7 @@
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("sunabako currently supports Linux x86_64");
 mod fsbroker;
+mod images;
 mod linux;
 mod model;
 mod runtime;
@@ -12,9 +13,10 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 fn input<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
@@ -44,9 +46,14 @@ fn usage() -> Value {
     json!({"usage":[
         "sunabako doctor",
         "sunabako --state DIR init-node CONFIG.json",
+        "sunabako --state DIR set-proot /absolute/path/to/proot",
         "sunabako --state DIR create SPEC.json|-",
+        "sunabako --state DIR create SPEC.json|- --token TOKEN",
+        "sunabako --state DIR cancel-create ID TOKEN",
         "sunabako --state DIR list|capacity",
         "sunabako --state DIR inspect|pause|resume|stop|start|delete ID",
+        "sunabako --state DIR delete ID --defer",
+        "sunabako --state DIR gc",
         "sunabako --state DIR exec ID -- COMMAND [ARGS...]",
         "sunabako --state DIR rpc ID REQUEST.json|-",
         "sunabako --state DIR hibernate ID -- CHECKPOINT_COMMAND [ARGS...]",
@@ -96,6 +103,23 @@ fn run() -> Result<Value> {
         return Ok(json!({"version":env!("CARGO_PKG_VERSION")}));
     }
     linux::require_root()?;
+    if cmd == "set-proot" {
+        let binary = PathBuf::from(a.get(1).context("set-proot requires an executable path")?);
+        ensure!(binary.is_absolute(), "PRoot path must be absolute");
+        let binary = fs::canonicalize(binary)?;
+        let metadata = fs::metadata(&binary)?;
+        ensure!(
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            "PRoot path must be an executable file"
+        );
+        // Use an immutable versioned binary: active tracers keep their executable,
+        // and new starts grant Landlock access to the same inode they execute.
+        let _lock = store::lock(&state)?;
+        let mut cfg = store::config(&state)?;
+        cfg.proot_binary = Some(binary);
+        store::atomic(&state.join("node.json"), &cfg)?;
+        return Ok(json!({"config":cfg}));
+    }
     if cmd == "init-node" {
         let cfg: NodeConfig = input(a.get(1).context("init-node requires CONFIG.json")?)?;
         cfg.validate()?;
@@ -111,11 +135,85 @@ fn run() -> Result<Value> {
         return Ok(json!({"config":cfg,"hard_aggregate_memory_limit":cfg.cgroup_parent.is_some()}));
     }
     let cfg = store::config(&state)?;
+    if matches!(cmd, "gc" | "__gc") {
+        let _slot = images::preparation_slot(&state, "delete", 4)?;
+        let trash = state.join(".trash");
+        let paths = if cmd == "__gc" {
+            let name = a.get(1).context("cleanup requires trash entry")?;
+            ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+                "invalid trash entry"
+            );
+            vec![trash.join(name)]
+        } else if trash.exists() {
+            fs::read_dir(trash)?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<std::io::Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        for path in paths {
+            if let Err(error) = fs::remove_dir_all(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.into());
+                }
+            }
+        }
+        return Ok(json!({"cleanup_complete":true}));
+    }
     if cmd == "create" {
+        let spec = input::<Spec>(a.get(1).context("create requires SPEC.json")?)?;
+        if a.len() == 2 {
+            return store::create(&state, spec, None);
+        }
+        ensure!(
+            a.len() == 4 && a[2] == "--token",
+            "create accepts only --token TOKEN"
+        );
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg("--state")
+            .arg(&state)
+            .arg("__create")
+            .arg(&a[3])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut worker = command.spawn()?;
+        {
+            let mut stdin = worker.stdin.take().context("preparation input pipe")?;
+            serde_json::to_writer(&mut stdin, &spec)?;
+            stdin.flush()?;
+        }
+        let result = worker.wait_with_output()?;
+        ensure!(
+            result.status.success(),
+            "creation worker failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return Ok(serde_json::from_slice(&result.stdout)?);
+    }
+    if cmd == "__create" {
         return store::create(
             &state,
-            input::<Spec>(a.get(1).context("create requires SPEC.json")?)?,
+            input::<Spec>("-")?,
+            Some(a.get(1).context("creation token")?),
         );
+    }
+    if cmd == "cancel-create" {
+        ensure!(a.len() == 3, "cancel-create requires ID TOKEN");
+        return store::cancel_create(&state, &a[1], &a[2]);
     }
     if cmd == "list" {
         return Ok(Value::Array(
@@ -166,37 +264,38 @@ fn run() -> Result<Value> {
         } else {
             command_request(&a[2..])
         };
-        // Serialize connection setup with lifecycle actions, but allow pause during a long exec.
-        {
-            let _lock = store::lock(&state)?;
-            ensure!(
-                store::status(&d)?.state == "running",
-                "sandbox must be running"
-            );
-        }
+        // Status is published atomically. The node lock cannot protect this
+        // RPC from a later stop, and waiting for unrelated rootfs clones here
+        // stalls tool calls in every live sandbox on the node.
+        ensure!(
+            store::status(&d)?.state == "running",
+            "sandbox must be running"
+        );
         return runtime::rpc(&d, &request);
     }
-    let _lock = store::lock(&state)?;
+    // Lifecycle changes serialize with other operations on the same sandbox.
+    // Only starting a stopped sandbox needs a new node admission reservation.
+    let _lifecycle = store::lifecycle_lock(&d)?;
+    ensure!(
+        !matches!(store::status(&d)?.state.as_str(), "creating" | "starting"),
+        "sandbox creation or startup is still in progress"
+    );
     match cmd {
         "pause" => store::transition(&d, "paused"),
         "resume" => store::transition(&d, "running"),
         "stop" => store::transition(&d, "stopped"),
         "start" => {
+            let _lock = store::lock(&state)?;
             store::start_locked(&state, &d, &cfg)?;
             store::inspect(&d)
         }
         "delete" => {
+            let deferred = a.get(2).map(String::as_str) == Some("--defer");
             ensure!(
-                !store::active(&store::status(&d)?),
-                "stop sandbox before delete"
+                a.len() == 2 || (a.len() == 3 && deferred),
+                "delete accepts only --defer"
             );
-            fs::remove_dir_all(&d)?;
-            if let Some(cg) = store::cgroup_path(&cfg, id) {
-                if cg.exists() {
-                    fs::remove_dir(cg)?;
-                }
-            }
-            Ok(json!({"deleted":id}))
+            store::remove_stopped(&state, &d, &cfg, deferred)
         }
         "hibernate" => {
             ensure!(
@@ -248,7 +347,10 @@ fn run() -> Result<Value> {
                 store::status(&d)?.state == "hibernated",
                 "restore requires an application checkpoint"
             );
-            store::start_locked(&state, &d, &cfg)?;
+            {
+                let _lock = store::lock(&state)?;
+                store::start_locked(&state, &d, &cfg)?;
+            }
             let result = runtime::rpc(&d, &command_request(&a[2..]))?;
             ensure!(result["exit_code"] == 0, "restore command failed: {result}");
             Ok(json!({"sandbox":store::inspect(&d)?,"restore":result}))

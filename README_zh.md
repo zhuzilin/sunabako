@@ -2,9 +2,11 @@
 
 [English](README.md)
 
+[更新记录](CHANGELOG.md)
+
 **在现有容器内部运行 Linux 沙箱，无需 Docker-in-Docker。** Rust runtime 负责资源分配、隔离和生命周期，Python SDK 提供 `Sandbox.create()`、`commands.run()`、`files.read/write()` 等接口。通过 SSH 添加节点，可以将 rollout 沙箱分配到多台机器。
 
-这是一个早期实现。当前四机环境支持 user namespace 和 Landlock，但 cgroup 挂载只读，AppArmor 也限制了 mount 操作；PRoot 后端在这种环境下支持目录映射。**生产模式要求内核强制执行沙箱池的内存总量上限，否则拒绝启动。** `allow_unbounded_memory_for_tests` 仅供有界功能测试，无法防止外层容器 OOM，不能用于生产环境超额分配内存。
+这是一个早期实现。在支持 user namespace 和 Landlock、但不允许私有 mount 的环境中，PRoot 后端可提供目录映射。**生产模式要求内核强制执行沙箱池的内存总量上限，否则拒绝启动。** `allow_unbounded_memory_for_tests` 仅供有界功能测试，无法防止外层容器 OOM，不能用于生产环境超额分配内存。
 
 ## 构建与安装
 
@@ -25,8 +27,8 @@ wheel 包含静态链接的 Rust 可执行文件和 Python SDK。使用本地 ta
 保持 `Cargo.toml`、`Cargo.lock`、`pyproject.toml` 和 `python/sunabako/__init__.py` 的版本一致。提交并推送发布内容后，推送对应的版本标签：
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 只有 `v*` 标签的 push 会构建 wheel 和源码包、验证安装并发布。分支 push、pull request 和手动运行仅执行 Rust 格式、Clippy 和测试检查。发布任务等待所有检查通过，再核对标签版本，上传已经验证的同一份 wheel 和源码包。
@@ -39,6 +41,8 @@ bash scripts/build-proot.sh
 ```
 
 PRoot 是独立的 GPL-2.0-or-later 可执行程序，`patches/proot-pidns.patch` 采用相同许可证；构建脚本固定上游代码和子模块版本。sunabako 的 Rust/Python 代码采用 Apache-2.0。导入 Python 包时不会自动下载或执行 PRoot。
+
+内核支持时，PRoot 默认启用 seccomp 加速，跳过无需路径或身份转换的 syscall 跟踪。运行时的 syscall 限制、Landlock 规则和资源监控仍然启用。实际任务的吞吐改善需要单独测量，不能直接使用 syscall 微基准的加速倍数。
 
 ## 配置节点和镜像
 
@@ -59,8 +63,8 @@ sunabako 对齐 **e2b Python SDK 中创建沙箱、运行命令、读写文件�
 
 | e2b 风格的调用 | sunabako 的支持范围与迁移方式 |
 | --- | --- |
-| `Sandbox.create(template=..., envs=...)` | 支持。`template` 是**所选节点上已经解包的 rootfs 路径**，不是 e2b template ID 或 OCI 镜像名。先导入镜像，再通过 `node=` 或 `cluster=` 选择节点，并配置内存、目录映射、GPU 和网络。 |
-| `AsyncSandbox.create(...)` | 提供相同配置的异步接口，内部通过工作线程执行本地或 SSH 客户端操作。 |
+| `Sandbox.create(template=..., envs=...)` | 支持。`template` 是**所选节点可读的 rootfs 目录或压缩 OCI layout 目录**，不是 e2b template ID 或 OCI 镜像名。先导入镜像，再通过 `node=` 或 `cluster=` 选择节点，并配置内存、目录映射、GPU 和网络。 |
+| `AsyncSandbox.create(...)` | 提供相同配置的异步接口，通过 asyncio 子进程执行本地或 SSH 操作。 |
 | `sb.commands.run(cmd, timeout=..., envs=..., cwd=..., user=...)` | 支持 shell 字符串和 argv 列表，返回 `CommandResult`：包含 `exit_code`、`stdout`、`stderr`，以及 `timed_out`、`truncated`。默认超时 120 秒、目录 `/workspace`、沙箱内用户 `root`。 |
 | 非零退出码处理 | 默认抛出 **sunabako 自己的** `CommandExitException`，需从 `sunabako` 导入；捕获 e2b 的同名异常不会生效。设置 `check=False` 则返回结果供调用方检查。 |
 | `sb.files.write(path, data)` | 接受 `str`、`bytes` 或宿主侧 `Path`，返回 `None`。不接受 file-like 对象，不提供批量写入或 `WriteInfo` 返回值。 |
@@ -93,6 +97,15 @@ with Sandbox.create(node=node, runtime="proot", memory_mb=2048) as sb:
 在 slime 中，`examples/coding_agent_rl/sunabako_sandbox.py` 将 SDK 接到共享的 `slime.agent.sandbox.Sandbox` 小接口上：异步 `exec()` 返回 `(exit_code, stdout, stderr)`，并提供 `write_file()`、`read_file()` 和异步上下文管理。example 的 `sandbox.py` 默认选择 sunabako，agent 和 grader 使用同一 provider。这里适配的是 slime 的共享协议，并不意味着实现了完整 e2b SDK。
 
 ## Python 使用
+
+`create_timeout` 控制 SDK 等待镜像准备和创建完成的时间，默认 600 秒，`None` 表示不设等待期限；它不控制已创建沙箱的存活时间。
+
+SDK 为每次创建请求生成独立的归属 token。传输出错或调用被取消时，SDK 会让节点
+取消对应请求，覆盖仍在准备镜像、复制 rootfs，以及创建成功但回复丢失的情况。
+节点核对归属后停止进程，将已停止的 rootfs 移出状态目录，再通过有并发上限的
+后台任务删除。取消标记会阻止迟到的旧请求重新创建。清理 RPC 最多等待 60 秒，
+无法确认清理时会报告错误，因此调用的总耗时可能超过创建等待期限。
+更新客户端前应先部署匹配的节点运行时；不带 token 的旧 CLI 创建仍保留显式生命周期操作。
 
 ```python
 from sunabako import Sandbox, Node, Mount
@@ -171,11 +184,37 @@ sb.snapshot("/shared/snapshots/task-001")
 
 Landlock ABI 1 上使用小型 helper 保持包管理器所需的跨目录 rename 和 hard-link 语义。每个 helper 都通过内核 chroot 限制在一个可写映射中，使用沙箱 UID，移除 capabilities 和无关文件描述符。只读映射不启动 helper。这些进程计入同一沙箱 cgroup，也纳入 RSS 监测。
 
+进程监控复用数量有上限的 `/proc` 文件句柄，每个监控周期仍读取最新数据。已退出进程和线程的句柄会被释放，并为生命周期操作预留文件描述符。这会减少重复的文件系统查找，监控间隔保持原值。
+
 沙箱共享 Linux 内核，启用 GPU 时也共享 GPU 驱动；它不是虚拟机，尚未通过针对不可信多租户使用的安全审计。目前还没有交互式 PTY API、自动 overlay 镜像层共享、透明 CRIU/CUDA 进程 checkpoint 或 GPU 显存配额。
 
 ## 验证
 
-当前环境已经在四台 H100 节点上通过真实 CUDA kernel 检查，并验证可写 volume 持久化、两个沙箱共享 GPU、暂停与恢复、应用 checkpoint 休眠、文件系统快照和跨沙箱文件系统隔离。集成测试也检查生产模式在缺少内存池硬上限时拒绝启动。由于外层 cgroup 只读，这里的功能测试使用显式 RSS 测试模式。
+`python tests/creation_cancellation.py --help` 提供隔离节点测试参数，覆盖准入前、
+镜像与 rootfs 准备期间、启动交接时，以及成功回复丢失后的取消。测试还检查 ID
+复用、旧 CLI、其他运行实例、同步/异步 SDK 超时和最终文件清理。
+取消标记保留在节点本地的 `.cancelled` 目录中，以阻止任意延迟的旧请求重新生效。
+
+PRoot 补丁用其自身跟踪的任务列表转换数字 PID/TID，避免扫描宿主机所有进程。
+namespace 映射只在对应被跟踪任务的生命周期内缓存，宿主机 PID 改变时重新读取。
+非主线程执行新程序后，Linux 会将其 TID 改为主线程的 PID；补丁保留执行线程的
+加载器状态。此处理适用于 Sunabako 禁止 guest ptrace 的配置。
+
+用 `gcc -O2 -pthread -static` 编译 `verification/proc_lookup.c`，再通过
+`python tests/proc_lookup.py --help` 查看隔离测试参数。测试覆盖进程和线程路径、
+相对文件描述符的读取、进程退出、带存活子进程的非主线程 exec、暂停恢复和清理；
+需提供未使用的状态目录和独立 UID 范围，并使用有界 RSS 测试模式。
+提供 `--baseline-proot` 时，还会比较查询耗时
+并验证运行期间的 PRoot 升级。可用 `--workers 96` 测量额外存在 96 个休眠线程时的
+查询开销；这项测试不代表整个工作负载的吞吐量。
+
+已有节点可以先将新 PRoot 安装到独立的版本路径，再执行
+`sunabako --state /path/to/state set-proot /path/to/proot-version`。
+这个命令仅改变后续沙箱启动使用的程序路径；运行中的 tracer 继续使用原程序，
+已经开始创建的沙箱也可能使用原版本。旧版本应保留到使用它的进程退出。
+其他节点配置仍须先停止沙箱才能修改。
+
+集成测试覆盖真实 CUDA kernel、可写 volume 持久化、两个沙箱共享 GPU、暂停与恢复、应用 checkpoint 休眠、文件系统快照和跨沙箱文件系统隔离，也检查生产模式在缺少内存池硬上限时拒绝启动。请提供自己的集群配置和输出目录。没有可委派 cgroup 时，有界功能检查可显式选择 RSS 测试模式。
 
 Terminal Bench 2.1 的 `cancel-async-tasks` 镜像使用官方 oracle 和未修改的 verifier 验证，**6/6 测试通过，reward 为 1**。这是单个任务的运行时兼容性检查，不代表完整 benchmark 成绩。导入 `alexgshaw/cancel-async-tasks:20251031` 并克隆官方任务仓库后，可运行：
 
@@ -197,3 +236,13 @@ python tests/tb21.py \
 ## 许可证
 
 sunabako：[Apache-2.0](LICENSE)。独立 PRoot 程序及其补丁使用 GPL-2.0-or-later。
+
+## 共享压缩镜像与本地有界缓存
+
+使用 `python -m sunabako.images IMAGE /shared/images/task --download-only` 只下载压缩层，再把该目录作为 `template`。节点配置 `image_cache_dir`、`image_cache_max_bytes` 和 `image_cache_min_free_bytes`；`image_cache_import_concurrency`（默认 1）控制同时进行的冷解包数量。缓存与 sandbox state 必须位于支持 reflink 的本地盘。缺失镜像通过 `umoci raw unpack --rootless` 在本地解包，只生成所需的 rootfs，省去运行时 bundle 元数据和供 `umoci repack` 使用的文件系统清单。缓存命中后用 `cp --reflink=always` 创建沙箱副本，不需要 FUSE 或 mount 权限。共享盘不会展开 rootfs。创建沙箱时先在节点锁内预留内存、GPU 和 UID，再并行复制 rootfs；已有沙箱的 RPC 不等待该锁。异步客户端通过 asyncio 子进程发送 SSH 请求，不使用线程池。
+
+缓存按最近使用时间淘汰，克隆期间持有引用锁；缓存删除后已创建的写时复制副本仍有效。解包期间每 250 毫秒检查剩余空间，达到预留水位就中止导入；回收后仍不足则拒绝新建。缓存容量不包含运行中沙箱的新增写入，仍需监测本地空间及 inode。
+
+冷镜像在开始准备前就预留内存和 UID，让其他客户端能看到排队请求的资源需求。`rootfs_clone_concurrency`（默认 32）限制每个节点同时进行的 rootfs 复制和所有权修改；已有沙箱的 RPC 不受该队列阻塞。
+
+暂停、恢复、停止和删除使用单个沙箱的生命周期锁，不等待其他沙箱的准入。停止后可执行 `delete ID --defer`：先移出活动目录并返回 `cleanup_pending: true`，再由独立进程删除 rootfs，每节点最多同时删除四份。物理删除结束后才释放磁盘空间，应监测 state 下的 `.trash` 和 `cleanup.log`。节点重启或清理出错后可执行 `sunabako --state DIR gc` 完成残留清理。普通 `delete` 仍等待物理删除完成。

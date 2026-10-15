@@ -19,6 +19,12 @@ pub struct NodeConfig {
     /// This never provides a hard aggregate memory guarantee.
     pub allow_unbounded_memory_for_tests: bool,
     pub proot_binary: Option<PathBuf>,
+    /// Node-local extracted OCI cache. Shared storage keeps compressed blobs.
+    pub image_cache_dir: Option<PathBuf>,
+    pub image_cache_max_bytes: u64,
+    pub image_cache_min_free_bytes: u64,
+    pub image_cache_import_concurrency: usize,
+    pub rootfs_clone_concurrency: usize,
 }
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -33,6 +39,11 @@ impl Default for NodeConfig {
             monitor_interval_ms: 25,
             allow_unbounded_memory_for_tests: false,
             proot_binary: None,
+            image_cache_dir: None,
+            image_cache_max_bytes: 256 << 30,
+            image_cache_min_free_bytes: 8 << 30,
+            image_cache_import_concurrency: 1,
+            rootfs_clone_concurrency: 32,
         }
     }
 }
@@ -65,6 +76,20 @@ impl NodeConfig {
             "monitor interval must be 1..1000 ms"
         );
         ensure!(self.gpu_slots_per_device > 0, "GPU slots must be positive");
+        ensure!(
+            self.image_cache_import_concurrency > 0,
+            "image cache import concurrency must be positive"
+        );
+        ensure!(
+            self.rootfs_clone_concurrency > 0,
+            "rootfs clone concurrency must be positive"
+        );
+        if let Some(path) = &self.image_cache_dir {
+            ensure!(
+                path.is_absolute() && self.image_cache_max_bytes > 0,
+                "image cache needs an absolute local path and positive capacity"
+            );
+        }
         Ok(())
     }
 }
@@ -118,10 +143,13 @@ fn none() -> String {
 impl Spec {
     pub fn validate(&self) -> Result<()> {
         valid_id(&self.id)?;
-        ensure!(
-            self.rootfs.is_absolute() && self.rootfs.join("bin/sh").exists(),
-            "rootfs must be an absolute Linux rootfs containing /bin/sh"
-        );
+        ensure!(self.rootfs.is_absolute(), "rootfs must be absolute");
+        if !crate::images::is_oci(&self.rootfs) {
+            ensure!(
+                self.rootfs.join("bin/sh").exists(),
+                "rootfs must contain /bin/sh"
+            );
+        }
         ensure!(
             self.memory_bytes >= 16 << 20,
             "memory_bytes must be >= 16 MiB"

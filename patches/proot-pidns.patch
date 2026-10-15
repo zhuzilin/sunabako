@@ -38,77 +38,25 @@ index a20b353..4011a71 100644
  	if (status < 0)
  	    return status;
 diff --git a/src/path/proc.c b/src/path/proc.c
-index b48894f..25d6bba 100644
+index b48894f..74a7554 100644
 --- a/src/path/proc.c
 +++ b/src/path/proc.c
-@@ -25,12 +25,59 @@
+@@ -25,6 +25,7 @@
  #include <stdlib.h>		/* atoi(3), strtol(3), */
  #include <errno.h>		/* E*, */
  #include <assert.h>		/* assert(3), */
-+#include <dirent.h>
 +#include <unistd.h>
  
  #include "path/proc.h"
  #include "tracee/tracee.h"
- #include "path/path.h"
- #include "path/binding.h"
- 
-+/* Sunabako: inherited procfs names processes in the tracer's PID namespace.
-+ * Translate guest numeric PIDs/TIDs only among tasks in the tracee's namespace.
-+ * No cached PID mapping: a recycled PID must never resolve to another task.
-+ */
-+static pid_t sunabako_proc_pid(const Tracee *tracee, pid_t guest, bool threads)
-+{
-+    char directory[64], current_ns[64], candidate_ns[64], path[128], line[512];
-+    struct dirent *entry;
-+    DIR *dir;
-+    ssize_t ns_len, other_len;
-+    pid_t answer = guest;
-+    snprintf(path, sizeof(path), "/proc/%d/ns/pid", tracee->pid);
-+    ns_len = readlink(path, current_ns, sizeof(current_ns));
-+    if (ns_len < 0) return guest;
-+    if (threads) snprintf(directory, sizeof(directory), "/proc/%d/task", tracee->pid);
-+    else strcpy(directory, "/proc");
-+    dir = opendir(directory);
-+    if (!dir) return guest;
-+    while ((entry = readdir(dir)) != NULL) {
-+        pid_t host = atoi(entry->d_name), inner = 0;
-+        if (host <= 0) continue;
-+        snprintf(path, sizeof(path), "%s/%d/ns/pid", directory, host);
-+        other_len = readlink(path, candidate_ns, sizeof(candidate_ns));
-+        if (other_len != ns_len || memcmp(current_ns, candidate_ns, ns_len)) continue;
-+        snprintf(path, sizeof(path), "%s/%d/status", directory, host);
-+        FILE *f = fopen(path, "r");
-+        if (!f) continue;
-+        while (fgets(line, sizeof(line), f)) {
-+            if (!strncmp(line, "NSpid:", 6)) {
-+                char *cursor = line + 6, *end;
-+                while (*cursor) {
-+                    long value = strtol(cursor, &end, 10);
-+                    if (cursor == end) break;
-+                    inner = (pid_t)value; cursor = end;
-+                }
-+                break;
-+            }
-+        }
-+        fclose(f);
-+        if (inner == guest) { answer = host; break; }
-+    }
-+    closedir(dir);
-+    return answer;
-+}
-+
- /**
-  * This function emulates the @result of readlink("@base/@component")
-  * with respect to @tracee, where @base belongs to "/proc" (according
-@@ -50,10 +97,28 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
+@@ -50,10 +51,28 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
      pid_t pid;
  
      assert(comparison == compare_paths("/proc", base));
 +    if (strstr(base, "/task") && !strcmp(strrchr(base, '/'), "/task")) {
 +        pid_t guest = atoi(component);
 +        if (guest > 0) {
-+            pid_t host = sunabako_proc_pid(tracee, guest, true);
++            pid_t host = get_namespace_pid(tracee, guest);
 +            if (host != guest) {
 +                snprintf(result, PATH_MAX, "%s/%d", base, host);
 +                return CANONICALIZE;
@@ -121,7 +69,7 @@ index b48894f..25d6bba 100644
      case PATHS_ARE_EQUAL:
 +
 +        if (atoi(component) > 0) {
-+            pid_t guest = atoi(component), host = sunabako_proc_pid(tracee, guest, false);
++            pid_t guest = atoi(component), host = get_namespace_pid(tracee, guest);
 +            if (host != guest) {
 +                snprintf(result, PATH_MAX, "/proc/%d", host);
 +                return CANONICALIZE;
@@ -232,3 +180,164 @@ index 8d1cfac..8c06d53 100644
  	    /* Error reported by the kernel.  */
  	    if ((int) syscall_result < 0)
  		goto end;
+diff --git a/src/tracee/event.c b/src/tracee/event.c
+index 3b274bf..0dd0136 100644
+--- a/src/tracee/event.c
++++ b/src/tracee/event.c
+@@ -366,6 +366,18 @@ int event_loop()
+ 	    break;
+ 	}
+ 
++        /* Linux moves an execing non-leader thread to the leader's PID.
++         * Keep the execing thread's syscall/loader state for the exit stop.
++         * Sunabako forbids guest ptrace; do not change emulated tracer state.
++         */
++        if (WIFSTOPPED(tracee_status)
++            && (tracee_status >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8))) {
++            unsigned long former_pid = 0;
++            if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &former_pid) == 0
++                && former_pid > 0 && (pid_t)former_pid != pid) {
++                rekey_exec_tracee(pid, (pid_t)former_pid);
++            }
++        }
+ 	/* Get information about this tracee. */
+ 	tracee = get_tracee(NULL, pid, true);
+ 	assert(tracee != NULL);
+diff --git a/src/tracee/tracee.c b/src/tracee/tracee.c
+index 77b5de8..b2d9b45 100644
+--- a/src/tracee/tracee.c
++++ b/src/tracee/tracee.c
+@@ -1,3 +1,5 @@
++#include <unistd.h>
++#include <stdio.h>
+ /* -*- c-set-style: "K&R"; c-basic-offset: 8 -*-
+  *
+  * This file is part of PRoot.
+@@ -53,6 +55,63 @@
+ typedef LIST_HEAD(tracees, tracee) Tracees;
+ static Tracees tracees;
+ 
++/* Inherited procfs uses the tracer's PID namespace. Every sandbox task is
++ * already tracked by PRoot; looking at unrelated host processes turns a
++ * /proc/self or numeric PID lookup into a host-wide scan. Read the live
++ * tracee records instead. A task's PID namespace is fixed at creation. Keep
++ * its mapping in that task's zero-initialized Tracee, never across lifetimes.
++ */
++pid_t get_namespace_pid(const Tracee *tracee, pid_t guest)
++{
++    char current_ns[64], candidate_ns[64], path[64], line[512];
++    ssize_t ns_len, other_len;
++    Tracee *candidate;
++
++    if (guest <= 0) return guest;
++    snprintf(path, sizeof(path), "/proc/%d/ns/pid", tracee->pid);
++    ns_len = readlink(path, current_ns, sizeof(current_ns));
++    if (ns_len < 0) return guest;
++
++    LIST_FOREACH(candidate, &tracees, link) {
++        pid_t inner = 0;
++        FILE *status;
++        if (candidate->pid <= 0 || candidate->terminated) continue;
++        if (candidate->namespace_pid.host != candidate->pid) {
++            snprintf(path, sizeof(path), "/proc/%d/ns/pid", candidate->pid);
++            other_len = readlink(path, candidate_ns, sizeof(candidate_ns));
++            if (other_len <= 0 || other_len >= (ssize_t)sizeof(candidate_ns)) continue;
++            snprintf(path, sizeof(path), "/proc/%d/status", candidate->pid);
++            status = fopen(path, "r");
++            if (!status) continue;
++            while (fgets(line, sizeof(line), status)) {
++                if (!strncmp(line, "NSpid:", 6)) {
++                    char *cursor = line + 6, *end;
++                    while (*cursor) {
++                        long value = strtol(cursor, &end, 10);
++                        if (cursor == end) break;
++                        inner = (pid_t)value;
++                        cursor = end;
++                    }
++                    break;
++                }
++            }
++            fclose(status);
++            if (inner <= 0) continue;
++            memcpy(candidate->namespace_pid.name, candidate_ns, other_len);
++            candidate->namespace_pid.length = other_len;
++            candidate->namespace_pid.guest = inner;
++            /* Also invalidate if PRoot assigns a different host PID. */
++            candidate->namespace_pid.host = candidate->pid;
++        }
++        if (candidate->namespace_pid.guest == guest
++            && candidate->namespace_pid.length == ns_len
++            && !memcmp(current_ns, candidate->namespace_pid.name, ns_len))
++            return candidate->pid;
++    }
++    return guest;
++}
++
++
+ 
+ /**
+  * Remove @zombie from its parent's list of zombies.  Note: this is a
+@@ -347,6 +406,35 @@ Tracee *get_tracee(const Tracee *current_tracee, pid_t pid, bool create)
+     return (create ? new_tracee(pid) : NULL);
+ }
+ 
++/* Preserve the execing thread's loader state when Linux replaces its TID
++ * with the thread-group leader's PID. Guest ptrace is disabled in Sunabako;
++ * leave emulated-tracer relationships outside this supported path unchanged.
++ */
++void rekey_exec_tracee(pid_t pid, pid_t former_pid)
++{
++    Tracee *execer = get_tracee(NULL, former_pid, false);
++    Tracee *leader = get_tracee(NULL, pid, false);
++    Tracee *relative;
++
++    if (execer == NULL || execer->as_ptracee.ptracer != NULL
++        || execer->as_ptracer.nb_ptracees != 0
++        || (leader != NULL && (leader->as_ptracee.ptracer != NULL
++                               || leader->as_ptracer.nb_ptracees != 0)))
++        return;
++    if (leader != NULL) {
++        execer->parent = leader->parent;
++        execer->killall_on_exit |= leader->killall_on_exit;
++        LIST_FOREACH(relative, &tracees, link) {
++            if (relative->parent == leader) relative->parent = execer;
++        }
++        leader->killall_on_exit = false;
++        leader->pid = former_pid;
++        terminate_tracee(leader);
++    }
++    execer->clone = false;
++    execer->pid = pid;
++}
++
+ /**
+  * Mark tracee as terminated and optionally take action.
+  */
+diff --git a/src/tracee/tracee.h b/src/tracee/tracee.h
+index e9966c1..8862c1e 100644
+--- a/src/tracee/tracee.h
++++ b/src/tracee/tracee.h
+@@ -88,6 +88,14 @@ typedef struct tracee {
+     /* Process identifier. */
+     pid_t pid;
+ 
++    /* PID namespace identity belongs to this traced task's lifetime. */
++    struct {
++        pid_t host;
++        pid_t guest;
++        ssize_t length;
++        char name[64];
++    } namespace_pid;
++
+     /* Unique tracee identifier. */
+     uint64_t vpid;
+ 
+@@ -297,6 +305,8 @@ typedef struct tracee {
+ #define TRACEE(a) talloc_get_type_abort(talloc_parent(talloc_parent(a)), Tracee)
+ 
+ extern Tracee *get_tracee(const Tracee * tracee, pid_t pid, bool create);
++extern void rekey_exec_tracee(pid_t pid, pid_t former_pid);
++extern pid_t get_namespace_pid(const Tracee *tracee, pid_t guest);
+ extern Tracee *get_ptracee(const Tracee * ptracer, pid_t pid,
+ 			   bool only_stopped, bool only_with_pevent,
+ 			   word_t wait_options);

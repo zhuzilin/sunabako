@@ -1,7 +1,7 @@
 [package]
-include = ["Cargo.toml", "Cargo.lock", "src/**", "python/**", ".cargo/config.toml", "README*.md", "LICENSE", "pyproject.toml", "patches/*", "scripts/*", "tests/*.py", "configs/*.example.json", "verification/*.c"]
+include = ["Cargo.toml", "Cargo.lock", "src/**", "python/**", ".cargo/config.toml", "README*.md", "CHANGELOG.md", "LICENSE", "pyproject.toml", "patches/*", "scripts/*", "tests/*.py", "configs/*.example.json", "verification/*.c"]
 name = "sunabako"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Linux sandboxes inside existing containers, without a Docker daemon"

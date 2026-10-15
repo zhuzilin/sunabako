@@ -104,6 +104,17 @@ print(json.dumps({'version': version, 'sdk': sunabako.__file__, 'cli': str(binar
             timeout=30,
         )
         installed = json.loads(result.stdout)
+        subprocess.run(
+            [
+                str(python),
+                "-I",
+                str(Path(__file__).resolve().parents[1] / "tests/async_creation.py"),
+            ],
+            env=env,
+            cwd=root,
+            check=True,
+            timeout=30,
+        )
 
     report = {
         "wheel": wheel.name,
@@ -116,6 +127,7 @@ print(json.dumps({'version': version, 'sdk': sunabako.__file__, 'cli': str(binar
             "no build tools on PATH",
             "SDK/CLI version agreement",
             "real SDK-to-CLI invocation",
+            "async RPC, timeout, and cancellation regressions",
         ],
         "privileged_sandbox_tests": False,
     }

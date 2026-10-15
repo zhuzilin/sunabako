@@ -1,11 +1,12 @@
 use crate::model::Record;
 use anyhow::{bail, ensure, Context, Result};
 use std::{
+    collections::{HashMap, HashSet},
     ffi::CString,
     fs, io,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::{fs::MetadataExt, io::AsRawFd, net::UnixStream},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 pub fn cv(ret: i32, action: &str) -> Result<()> {
@@ -48,39 +49,250 @@ pub fn pidfd_signal(pid: i32, start: u64, sig: i32) -> Result<()> {
     cv(r, "pidfd_send_signal")
 }
 
-pub fn processes(init_pid: i32) -> Vec<(i32, u64, u64, char)> {
-    // Match the namespace, not process groups: double-fork/setsid cannot escape accounting.
-    let Ok(ns) = fs::read_link(format!("/proc/{init_pid}/ns/pid")) else {
-        return vec![];
-    };
-    let mut out = vec![];
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|v| v.parse::<i32>().ok()) else {
-            continue;
-        };
-        if fs::read_link(e.path().join("ns/pid")).ok().as_ref() != Some(&ns) {
-            continue;
-        }
-        if let Ok(s) = fs::read_to_string(e.path().join("stat")) {
-            if let Some((_, tail)) = s.rsplit_once(") ") {
-                let f: Vec<_> = tail.split_whitespace().collect();
-                if f.len() > 21 {
-                    let start = f[19].parse().unwrap_or(0);
-                    let rss: u64 = f[21].parse().unwrap_or(0);
-                    out.push((
-                        pid,
-                        start,
-                        rss.saturating_mul(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64),
-                        f[0].chars().next().unwrap_or('?'),
-                    ));
+pub fn terminate_preparation(pid: i32, start: u64) -> Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::time::{Duration, Instant};
+
+    struct Frozen(Vec<OwnedFd>);
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            // If inspection fails before termination, do not leave the owned
+            // preparations stopped. PIDfds cannot signal reused process IDs.
+            for fd in &self.0 {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd(),
+                        libc::SIGCONT,
+                        0usize,
+                        0,
+                    );
                 }
             }
         }
     }
-    out
+    fn open(pid: i32, start: u64) -> Result<OwnedFd> {
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        cv(raw, "open preparation pidfd")?;
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        ensure!(live(pid, start), "preparation process identity changed");
+        Ok(fd)
+    }
+    fn signal(fd: &OwnedFd, value: i32) -> Result<()> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                value,
+                0usize,
+                0,
+            ) as i32
+        };
+        if result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        cv(result, "signal preparation process")
+    }
+
+    let leader = open(pid, start)?;
+    ensure!(
+        unsafe { libc::getpgid(pid) } == pid && unsafe { libc::getsid(pid) } == pid,
+        "creation does not own a dedicated preparation session"
+    );
+    let mut frozen = Frozen(vec![leader]);
+    signal(&frozen.0[0], libc::SIGSTOP)?;
+    // The pinned leader owns this session; launch is serialized with cancellation.
+    // Stop members through pidfds too, so rollback can resume every task we stop.
+    // Repeat the scan until stopped children can no longer add descendants.
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut known = HashSet::from([(pid, start)]);
+    loop {
+        let mut stopped = true;
+        let mut added = false;
+        // Cancellation is exceptional; unlike hot-path sandbox accounting,
+        // this also finds orphaned tools still in the dedicated process group.
+        for entry in fs::read_dir("/proc")?.flatten() {
+            let Some(member) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, tail)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let fields: Vec<_> = tail.split_whitespace().collect();
+            if fields.len() <= 19 || fields[2].parse::<i32>().ok() != Some(pid) {
+                continue;
+            }
+            ensure!(
+                fields[3].parse::<i32>().ok() == Some(pid),
+                "preparation session changed"
+            );
+            let member_start: u64 = fields[19].parse()?;
+            if !known.contains(&(member, member_start)) {
+                let fd = match open(member, member_start) {
+                    Ok(fd) => fd,
+                    Err(_) if !live(member, member_start) => continue,
+                    Err(error) => return Err(error),
+                };
+                signal(&fd, libc::SIGSTOP)?;
+                frozen.0.push(fd);
+                known.insert((member, member_start));
+                added = true;
+            }
+            stopped &= matches!(fields[0], "T" | "t" | "Z" | "X");
+        }
+        if stopped && !added {
+            break;
+        }
+        ensure!(Instant::now() < until, "preparation processes did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fn wait(fd: &OwnedFd, until: Instant) -> Result<()> {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = until.saturating_duration_since(Instant::now()).as_millis() as i32;
+        let result = unsafe { libc::poll(&mut poll, 1, remaining) };
+        cv(result, "wait for preparation process exit")?;
+        ensure!(result > 0, "preparation process did not exit");
+        Ok(())
+    }
+    // Keep the stopped leader alive until all tools exit. If a tool cannot exit,
+    // rollback resumes the leader and preserves a verifiable owner for retry.
+    for fd in frozen.0.iter().skip(1).rev() {
+        signal(fd, libc::SIGKILL)?;
+    }
+    let until = Instant::now() + Duration::from_secs(10);
+    for fd in frozen.0.iter().skip(1) {
+        wait(fd, until)?;
+    }
+    signal(&frozen.0[0], libc::SIGKILL)?;
+    wait(&frozen.0[0], until)?;
+    Ok(())
+}
+
+pub fn processes(init_pid: i32) -> Vec<(i32, u64, u64, char)> {
+    // Lifecycle snapshots may run alongside the persistent monitor, which
+    // already owns its descriptor allowance. Keep one-off scans uncached.
+    let mut monitor = ProcessMonitor::new(init_pid);
+    monitor.max_files = 0;
+    monitor.processes()
+}
+
+pub struct ProcessMonitor {
+    init_pid: i32,
+    namespace: Option<PathBuf>,
+    files: HashMap<PathBuf, (fs::File, bool)>,
+    max_files: usize,
+}
+
+impl ProcessMonitor {
+    pub fn new(init_pid: i32) -> Self {
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        let max_files = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            (limit.rlim_cur as usize).saturating_sub(64).min(1024)
+        } else {
+            0
+        };
+        Self {
+            init_pid,
+            namespace: fs::read_link(format!("/proc/{init_pid}/ns/pid")).ok(),
+            files: HashMap::new(),
+            max_files,
+        }
+    }
+
+    fn read(&mut self, path: &Path) -> io::Result<String> {
+        if !self.files.contains_key(path) && self.files.len() < self.max_files {
+            self.files
+                .insert(path.to_owned(), (fs::File::open(path)?, false));
+        }
+        let Some((file, used)) = self.files.get_mut(path) else {
+            return fs::read_to_string(path);
+        };
+        // Rewinding regenerates procfs content. The open file remains tied to
+        // the original process/thread rather than following a reused PID.
+        let result = (|| {
+            file.seek(SeekFrom::Start(0))?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            Ok(text)
+        })();
+        *used = result.is_ok();
+        if result.is_err() {
+            self.files.remove(path);
+        }
+        result
+    }
+
+    pub fn processes(&mut self) -> Vec<(i32, u64, u64, char)> {
+        // PID-namespace init adopts orphaned descendants, including double forks
+        // and setsid children. Walk every thread's children instead of scanning the
+        // entire host /proc once per sandbox on every monitoring tick.
+        let Some(ns) = self.namespace.clone() else {
+            return vec![];
+        };
+        if fs::read_link(format!("/proc/{}/ns/pid", self.init_pid))
+            .ok()
+            .as_ref()
+            != Some(&ns)
+        {
+            self.files.clear();
+            return vec![];
+        }
+        for (_, used) in self.files.values_mut() {
+            *used = false;
+        }
+        let mut out = vec![];
+        let mut pending = vec![self.init_pid];
+        let mut seen = HashSet::new();
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        while let Some(pid) = pending.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            let path = std::path::PathBuf::from(format!("/proc/{pid}"));
+            if fs::read_link(path.join("ns/pid")).ok().as_ref() != Some(&ns) {
+                continue;
+            }
+            if let Ok(threads) = fs::read_dir(path.join("task")) {
+                for task in threads.flatten() {
+                    if let Ok(children) = self.read(&task.path().join("children")) {
+                        pending.extend(
+                            children
+                                .split_whitespace()
+                                .filter_map(|p| p.parse::<i32>().ok()),
+                        );
+                    }
+                }
+            }
+            if let Ok(s) = self.read(&path.join("stat")) {
+                if let Some((_, tail)) = s.rsplit_once(") ") {
+                    let f: Vec<_> = tail.split_whitespace().collect();
+                    if f.len() > 21 {
+                        let start = f[19].parse().unwrap_or(0);
+                        let rss: u64 = f[21].parse().unwrap_or(0);
+                        out.push((
+                            pid,
+                            start,
+                            rss.saturating_mul(page_size),
+                            f[0].chars().next().unwrap_or('?'),
+                        ));
+                    }
+                }
+            }
+        }
+        self.files.retain(|_, (_, used)| *used);
+        out
+    }
 }
 
 pub fn tasks(init_pid: i32) -> Vec<(i32, i32, u64, char)> {
@@ -702,4 +914,88 @@ pub fn require_root() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn cached_process_monitor_discovers_new_children_and_releases_exited_files() {
+        let root = std::process::id() as i32;
+        let mut monitor = ProcessMonitor::new(root);
+        assert!(monitor.processes().iter().any(|p| p.0 == root));
+        // The leader and this worker thread's children files are already open.
+        // A later fork must still appear through those same descriptors.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let found = monitor.processes().iter().any(|p| p.0 == pid);
+        let child_path = PathBuf::from(format!("/proc/{pid}"));
+        let cached = monitor.files.keys().any(|p| p.starts_with(&child_path));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(found);
+        assert!(cached);
+        assert!(!monitor.processes().iter().any(|p| p.0 == pid));
+        assert!(!monitor.files.keys().any(|p| p.starts_with(&child_path)));
+    }
+
+    #[test]
+    fn process_monitor_falls_back_when_descriptor_budget_is_exhausted() {
+        let root = std::process::id() as i32;
+        let mut monitor = ProcessMonitor::new(root);
+        monitor.max_files = 1;
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let all = monitor.processes();
+        let again = monitor.processes();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(monitor.files.len() <= 1);
+        for processes in [all, again] {
+            assert!(processes.iter().any(|p| p.0 == root));
+            assert!(processes.iter().any(|p| p.0 == pid));
+        }
+    }
+
+    #[test]
+    fn process_accounting_follows_thread_children_and_new_sessions() {
+        // Rust runs this test on a worker thread; its child is absent from the
+        // process leader's children file. The child starts a separate session.
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant: i32 = line.trim().parse().unwrap();
+        let root = std::process::id() as i32;
+        let all = processes(root);
+        let subtree = processes(child.id() as i32);
+        // Only the explicitly created session is signalled, independent of
+        // the accounting function's output.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        child.wait().unwrap();
+        for pid in [child.id() as i32, descendant] {
+            assert!(all.iter().any(|p| p.0 == pid));
+            assert!(subtree.iter().any(|p| p.0 == pid));
+        }
+        assert!(!subtree.iter().any(|p| p.0 == root));
+    }
 }

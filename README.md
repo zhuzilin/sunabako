@@ -2,14 +2,15 @@
 
 [中文版](README_zh.md)
 
+[Release notes](CHANGELOG.md)
+
 Linux sandboxes **inside an existing container**, without Docker-in-Docker. A
 Rust runtime manages resource admission, isolation and lifecycle; a Python SDK
 provides familiar `Sandbox.create()`, `commands.run()` and `files.read/write()`
 interfaces. Add SSH nodes to distribute rollout sandboxes across an allocation.
 
-This is an early implementation. The current four-machine environment provides
-user namespaces and Landlock, but its cgroup mount is read-only and AppArmor
-blocks mounts. The PRoot backend supports directory mappings in this environment.
+This is an early implementation. The PRoot backend supports directory mappings
+when user namespaces and Landlock are available but private mounts are blocked.
 **Production startup refuses to proceed without a hard aggregate cgroup memory
 limit.** The explicitly named `allow_unbounded_memory_for_tests` option is for
 bounded functional verification only; it is not protection against outer-container
@@ -53,8 +54,8 @@ Keep the versions in `Cargo.toml`, `Cargo.lock`, `pyproject.toml` and
 files, push the matching version tag:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 Only a `v*` tag push builds wheel/source distributions, runs the packaging checks
@@ -76,6 +77,11 @@ PRoot remains a separate GPL-2.0-or-later executable. The Rust/Python project is
 Apache-2.0. `patches/proot-pidns.patch` modifies PRoot and is GPL-2.0-or-later;
 the script pins its upstream source and submodule revisions. PRoot is not
 silently downloaded or executed on package import.
+
+PRoot uses its default seccomp acceleration when supported by the kernel. This
+avoids tracing system calls that need no path or identity translation. The
+runtime's syscall restrictions, Landlock rules, and resource monitoring remain
+enabled. Validate workload throughput separately from syscall microbenchmarks.
 
 ## Configure a node and an image
 
@@ -109,8 +115,8 @@ review the supported methods below. The implementation is in
 
 | e2b-style call | sunabako support and migration details |
 | --- | --- |
-| `Sandbox.create(template=..., envs=...)` | Supported. `template` is an **unpacked rootfs path on the chosen node**, not an e2b template ID or an OCI image name. Import the image first. Select `node=` or `cluster=` and configure memory, mounts, GPU and network explicitly. |
-| `AsyncSandbox.create(...)` | Async counterpart with the same options. Async operations delegate to the local/SSH client using worker threads. |
+| `Sandbox.create(template=..., envs=...)` | Supported. `template` is an **unpacked rootfs path or compressed OCI layout on the chosen node**, not an e2b template ID or an OCI image name. Import the image first. Select `node=` or `cluster=` and configure memory, mounts, GPU and network explicitly. |
+| `AsyncSandbox.create(...)` | Async counterpart with the same options, using asyncio subprocesses for local and SSH operations. |
 | `sb.commands.run(cmd, timeout=..., envs=..., cwd=..., user=...)` | Runs a shell string or argv list and returns `CommandResult` with `exit_code`, `stdout`, `stderr`, plus `timed_out` and `truncated`. Defaults are 120 seconds, `/workspace`, and guest `root`. |
 | Handling nonzero command exits | Raises **sunabako's** `CommandExitException` by default. Import it from `sunabako`; e2b's exception class does not catch it. `check=False` returns the result instead. |
 | `sb.files.write(path, data)` | Accepts `str`, `bytes`, or a host `Path`; returns `None`. No file-like object, batch-write or `WriteInfo` return support. |
@@ -127,7 +133,20 @@ rootfs and metadata. To release memory, use `stop()` or application-managed
 `hibernate(checkpoint_command)`; `start()` starts fresh processes, while
 `restore(restore_command)` explicitly restores application state.
 
-sunabako has no sandbox-lifetime `create(timeout=...)` or `set_timeout()` API.
+`create_timeout` controls how long the SDK waits for image preparation and
+creation (600 seconds by default; `None` waits without a deadline). It is not a
+sandbox lifetime. sunabako has no sandbox-lifetime `create(timeout=...)` or `set_timeout()` API.
+
+SDK creation requests carry a unique ownership token. On a transport error or
+cancellation, the SDK asks the node to cancel that request, including unfinished
+image preparation or a sandbox whose successful reply was lost. Cleanup checks
+ownership before stopping processes and detaches the stopped rootfs for bounded
+background deletion. A cancellation marker prevents a delayed request from
+creating the sandbox afterward. The SDK waits up to 60 seconds for the cleanup
+RPC and reports when cleanup cannot be confirmed; this can extend the caller's
+creation deadline. Deploy the matching runtime on remote nodes before updating
+clients. Existing CLI requests without a token retain their explicit lifecycle.
+
 Its command deadline stops the whole sandbox, including detached children.
 There is no automatic expiration or e2b-style resume-on-connect. Network access
 defaults to `network="none"`; choose `network="host"` when required. Node
@@ -234,6 +253,50 @@ redirect their standard streams to files before detaching them.
 `network="host"` allows network access through the outer container, sharing its
 network namespace. No virtual bridge or port publishing is installed.
 
+## Compressed images with a bounded local cache
+
+Download compressed OCI layers without extracting a rootfs on shared storage:
+
+```bash
+python -m sunabako.images docker.io/example/task:tag /shared/images/task --download-only
+```
+
+Pass `/shared/images/task` as `Sandbox.create(template=...)`. Configure
+`image_cache_dir` on node-local disk, `image_cache_max_bytes` (default 256 GiB),
+and `image_cache_min_free_bytes` (default 8 GiB). Set
+`image_cache_import_concurrency` (default 1) to bound simultaneous cold imports.
+`rootfs_clone_concurrency` (default 32) bounds concurrent rootfs copies and
+ownership changes on each node, leaving existing sandbox RPCs independent of
+that queue. Cold preparations reserve memory and UIDs before importing images.
+Install `umoci` on sandbox nodes.
+The sandbox state directory must also be local and support reflink copies from
+the cache. This path requires `cp --reflink=always`; it does not silently make
+full data copies on unsupported filesystems.
+
+A cache miss extracts the image locally with `umoci raw unpack --rootless`.
+Only the rootfs is needed; the cache does not generate runtime-bundle metadata
+or the filesystem manifest used by `umoci repack`. Warm creations reuse that rootfs and
+clone it with copy-on-write data sharing. An image is pinned while cloning;
+least-recently-used unpinned cache entries are evicted when needed. Evicting the
+original does not invalidate independent sandbox clones. Cold imports check
+free space every 250 ms and stop if the reserve is reached. New admissions fail
+if cache eviction cannot restore capacity. Writable sandbox data and inodes
+must also be monitored: the cache limit does not cap those writes.
+
+No FUSE, loop device, or filesystem mount is used. Shared storage contains only
+compressed layers and metadata. Small-file operations still happen on local
+disk. Existing directory templates continue to work as before.
+
+Lifecycle changes serialize per sandbox; pause, resume, stop, and delete do
+not wait for unrelated admissions. After stopping a sandbox, `delete ID --defer`
+removes it from the active namespace and returns `cleanup_pending: true` while
+a detached worker removes its rootfs. The SDK exposes this as
+`sb.kill(defer_cleanup=True)` (await it for `AsyncSandbox`). At most four deferred cleanups run per
+node. Disk space is recovered only when removal finishes; monitor `.trash`
+and `cleanup.log` in the state directory. Run `sunabako --state DIR gc` to
+finish pending removals after a node restart or cleanup error. Plain `delete`
+continues to wait for physical removal.
+
 ## Slime and multiple machines
 
 ```python
@@ -254,7 +317,10 @@ Install the wheel, runtime dependency, image and
 node configuration on each allocated machine; add nodes to the cluster file to
 expand capacity. SSH uses existing authentication. A capacity-ranked scheduler
 selects nodes; each node holds a lock during admission so concurrent clients
-cannot over-reserve memory or GPU slots. A transport timeout never blindly
+cannot over-reserve memory, GPU slots, or UID ranges. Rootfs cloning proceeds
+concurrently after those resources are reserved. Live sandbox RPCs do not wait
+for the node admission lock. The async client uses asyncio subprocess transport
+for SSH requests, without a worker thread pool. A transport timeout never blindly
 replays sandbox creation or command execution. Save `sandbox_id` and `node` to
 reconnect from a restarted client.
 
@@ -308,6 +374,11 @@ to exactly one writable mapping, uses the sandbox UID, and drops capabilities
 and unrelated file descriptors. Read-only mappings have no helper. These
 processes are charged to the same sandbox cgroup and included in RSS monitoring.
 
+Process monitoring reuses a bounded set of `/proc` file handles and reads fresh
+values on every monitoring tick. Handles for exited processes and threads are
+released; the descriptor limit leaves room for lifecycle operations. This reduces
+repeated filesystem lookups without changing the monitoring interval.
+
 This shares the Linux kernel and (when requested) a GPU driver. It is not a VM,
 and has not received a security audit for hostile multi-tenant use. Current
 limitations include no interactive PTY API, no automatic overlay-layer sharing,
@@ -315,12 +386,44 @@ no transparent CRIU/CUDA process checkpoint, and no GPU memory quotas.
 
 ## Verification
 
-The current container environment passed the real CUDA kernel probe on all four
-allocated H100 nodes, writable-volume persistence, two sandboxes sharing one GPU,
-pause/resume, application-checkpoint hibernation, filesystem snapshots, and
-cross-sandbox filesystem checks. The integration suite also verifies that normal
-node startup refuses a missing aggregate cgroup limit. Functional tests here use
-explicit RSS test mode because the outer cgroup mount is read-only.
+`python tests/creation_cancellation.py --help` describes an isolated real-node
+check of cancellation before admission, during image/clone preparation, at the
+launch boundary, and after a successful creation reply is lost. It also checks
+reused sandbox IDs, legacy CLI creation, unrelated live sessions, sync/async SDK
+timeouts, and eventual rootfs cleanup. Cancellation tombstones stay in the node's
+local `.cancelled` directory so arbitrarily late requests cannot revive.
+
+The PRoot patch translates numeric process and thread IDs using PRoot's live
+task list, avoiding scans of unrelated host processes. Namespace mappings are
+cached only for each traced task's lifetime and refreshed if its host PID changes.
+When a non-leader thread executes a program, the patch preserves that thread's
+loader state as Linux assigns it the leader's PID. This handling applies to
+Sunabako's configuration with guest ptrace disabled.
+
+To check lookup behavior, compile `verification/proc_lookup.c` with
+`gcc -O2 -pthread -static`, then run
+`python tests/proc_lookup.py --help` for the isolated runtime test arguments.
+The test checks numeric PID/TID paths, fd-relative reads, process exit,
+non-leader exec with a surviving child, pause/resume, and cleanup. It requires an
+unused state directory and dedicated UID range; it uses bounded RSS test mode.
+Supplying `--baseline-proot` also
+compares lookup latency and verifies a live PRoot upgrade. Use `--workers 96`
+to measure lookups with 96 additional sleeping threads; the result measures
+procfs lookup overhead rather than whole-workload throughput.
+
+For an existing node, install a new PRoot build at a distinct versioned path,
+then run `sunabako --state /path/to/state set-proot /path/to/proot-version`.
+This changes only the binary used for subsequent sandbox starts. Running
+tracers keep their current executable, and creations already in progress may
+finish with the old version. Keep both binaries in place until their users
+have exited. Other node configuration changes still require stopping sandboxes.
+
+The integration suite covers real CUDA kernels, writable-volume persistence,
+two sandboxes sharing one GPU, pause/resume, application-checkpoint hibernation,
+filesystem snapshots, and cross-sandbox filesystem checks. It also verifies that
+normal node startup refuses a missing aggregate cgroup limit. Supply your own
+cluster configuration and artifact directory. Bounded functional checks can
+explicitly select RSS test mode when delegated cgroups are unavailable.
 
 Terminal Bench 2.1's `cancel-async-tasks` image was tested using its official oracle
 and unmodified verifier: **6/6 tests passed, reward 1**. This is one task's runtime

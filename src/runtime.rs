@@ -563,7 +563,6 @@ fn proot_init(
     cmd.env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("PROOT_TMP_DIR", root.join("tmp"))
-        .env("PROOT_NO_SECCOMP", "1")
         .env("SUNABAKO_INIT", serde_json::to_string(&(record, config))?)
         .env("SUNABAKO_SINGLE_UID", "1")
         .env("SUNABAKO_RENAME_HELPERS", helper_map)
@@ -759,10 +758,11 @@ pub fn supervise(dir: &Path, config: &NodeConfig) -> Result<()> {
         .filter_map(|pid| linux::start_time(pid).map(|start| (pid, start)))
         .collect();
     let mut last_write = Instant::now();
+    let mut process_monitor = linux::ProcessMonitor::new(status.init_pid);
     loop {
         let desired: String =
             store::read(&dir.join("desired.json")).unwrap_or_else(|_| "stopped".into());
-        let procs = linux::processes(status.init_pid);
+        let procs = process_monitor.processes();
         status.process_count = procs.iter().filter(|p| p.3 != 'Z').count();
         status.memory_current = if record.spec.memory_mode == "cgroup" {
             cg.as_ref()

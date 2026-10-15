@@ -1,8 +1,8 @@
 {
   "nodes": [
-    {"name": "node0", "host": "100.113.71.45", "port": 2222, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"},
-    {"name": "node1", "host": "100.113.72.44", "port": 2222, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"},
-    {"name": "node2", "host": "100.113.73.47", "port": 2222, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"},
-    {"name": "node3", "host": "100.113.74.64", "port": 2222, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"}
+    {"name": "node0", "host": "sandbox-0", "port": 22, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"},
+    {"name": "node1", "host": "sandbox-1", "port": 22, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"},
+    {"name": "node2", "host": "sandbox-2", "port": 22, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"},
+    {"name": "node3", "host": "sandbox-3", "port": 22, "rootfs": "/var/lib/sunabako-images/ubuntu/rootfs"}
   ]
 }
